@@ -1,19 +1,57 @@
-# Initial implementation: incomplete coverage
+# Native core implementation and validation
 
-Goal: standalone stable Rust CLI, local probes, no hosted WhereDNS dependency.
-Architecture: clap arguments, versioned serde JSON envelope, sequential bounded subprocesses for dig/curl/ping; native TCP connect timeout. Output captures at most 256 KiB per stream. Child processes are killed on deadline. OS cancellation uses default process behavior; process-group cancellation is not implemented.
+## Product and architecture
 
-Implemented: generic DNS ANY evidence, MX evidence, reverse lookup evidence, HTTPS HEAD, domain RDAP fetch, literal-IP TCP connect, OS ping. JSON is a typed envelope around raw utility evidence, not typed protocol records. Hostname networking requires explicit --allow-private because utility resolution is not pinned. Redirects are not followed. No shell interpolation. No hosted WhereDNS calls.
+Standalone stable Rust CLI for local single-target diagnosis. clap parses target,
+category and bounded options; Tokio schedules at most 4 operations by default
+(configurable 1–16), with per-operation timeout and aggregate deadline. DNS uses
+hickory wire messages over UDP with TCP fallback, typed records, response matching;
+HTTP uses reqwest/rustls, pinned checked destinations, six-hop redirect cap, 1 MiB
+RDAP body cap. Ctrl-C cancels async work and OS ping is killed on drop. Results
+use a versioned serde envelope; protocol evidence is nested JSON. No persistence.
+This project is separate from the hosted website. Read-only behavior references
+were consulted; hosted schemas are not a compatibility promise.
 
-Missing: authoritative propagation, subdomains, header parsing, full email policy suite, DNS wire parser and selected types, IP ASN/BGP enrichment, bootstrap RDAP routing, blacklist checks, bounded parallel scheduling, robust cancellation, full reserved-address policy, native dependency-free DNS/HTTP, structured protocol output and fixtures. This is an initial foundation, not completion of the requested full product. System utilities must be installed separately; Windows DNS requires dig.
+## Coverage
 
-Actual Linux validation: cargo test: 1 passed; cargo fmt; cargo clippy -- -D warnings; cargo build. Binary --version: `wheredns 0.1.0`. Help lists target/check, JSON, private permission, timeout and port. JSON fixture output:
+- Summary: DNS, public domain RDAP and reverse IP evidence. No provider attribution heuristics.
+- DNS: selected positional types or --type; TTL, owner, type, values, response code;
+  NODATA distinct from NXDOMAIN and transport timeout; UDP with TCP fallback.
+- Email: MX and TXT, SPF evidence, DMARC, selected DKIM owners, MTA-STS DNS,
+  TLS-RPT, BIMI DNS evidence. No policy evaluator, MTA-STS HTTPS policy fetch,
+  signature validation or delivery test.
+- RDAP: domain/IP JSON through rdap.org redirect routing; no local IANA bootstrap.
+- IP: addresses and PTR. ASN, prefix and forward-confirmed reverse lookup remain gaps.
+- HTTP: HEAD, checked redirects, status, headers, per-response elapsed time,
+  rustls certificate validation. Certificate metadata and split TCP/TLS timings remain gaps.
+- TCP: up to ten supplied ports, default 443, bounded connect timing, first resolved IP.
+- ICMP: actual OS ping, three requests, deadline, raw OS latency/loss summary.
+  Structured sample parsing and locale-independent permission classification remain gaps.
+- Propagation: up to six authoritative servers, A and SOA evidence. Automatic agreement
+  classification remains a gap; compare returned records/serials.
+- Subdomains: 20 common names, A records and randomized wildcard control evidence.
+  Automatic wildcard labeling and AAAA controls remain gaps.
+- Headers: explicit stdin command, 64 KiB bound, unfolding, duplicate fields,
+  malformed count; authentication evidence marked untrusted. Routing analysis remains a gap.
+- Blocklists: unimplemented; no deliverability claims.
 
-```json
-{"schema_version":1,"target":"127.0.0.1","check":"tcp","ok":false,"evidence":"private target requires --allow-private"}
-```
+## Actual Linux validation (2026-11-19)
 
-stdin fixture output: `dns 127.0.0.1: private target requires --allow-private` (exit 1).
-Two live probes only: `1.1.1.1 dns` returned DNS NXDOMAIN evidence (utility exit success is not DNS answer success); `example.com web --allow-private` returned HTTP/2 200. No live sweeps. macOS and Windows execution untested locally; CI configured, not claimed passing.
+cargo test --locked: 4 unit tests passed, 1 integration test passed, 0 failed.
+cargo fmt --check: exit 0.
+cargo clippy --locked -- -D warnings: exit 0.
+cargo build --locked: exit 0.
+Binary --version: wheredns 0.1.0. Integration test executes help/version, missing
+input exit 2, piped folded/duplicate header JSON and no ANSI.
 
-Packaging: build with `cargo build --locked --release`; distribute the resulting wheredns executable with system utility requirements documented. No release, installer, Homebrew publication, checksum or download URL exists. Before distribution, build natively on each CI OS, archive binary with README, compute SHA-256 from that archive, and verify extracted --version. Packaging automation remains incomplete.
+Two sequential live checks in this native pass, no sweeps:
+example.com dns A --json: exit 0, 14 ms; 104.20.23.154 and 172.66.147.243,
+TTL 115, resolver 1.1.1.1:53, status No Error.
+https://example.com web --json: exit 0, 85 ms total; HTTP 200, 56 ms response.
+DNS request fanout: one query; HTTPS fanout: A + AAAA and one HEAD.
+Earlier foundation pass performed two utility probes; no live all/ports/subdomain tests.
+
+macOS ARM/Intel and Windows execution is untested locally. CI matrix builds/tests
+and uploads native binaries; no release/deployment steps. Homebrew and Scoop
+are explicit unrendered templates requiring verified archives and SHA-256 hashes.
+Windows ZIP/WinGet preparation is documented. No release/package is published.

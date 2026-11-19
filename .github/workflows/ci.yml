@@ -18,3 +18,11 @@ jobs:
       - run: cargo test --locked
       - run: cargo clippy --locked -- -D warnings
       - run: cargo build --locked --release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheredns-${{ matrix.os }}
+          path: |
+            target/release/wheredns
+            target/release/wheredns.exe
+          if-no-files-found: error

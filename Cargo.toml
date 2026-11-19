@@ -11,3 +11,14 @@ serde_json = "1"
 [profile.dev]
 debug = 0
 incremental = false
+[dependencies.tokio]
+version = "1"
+features = ["rt-multi-thread", "macros", "net", "time", "signal", "process", "io-util", "sync"]
+[dependencies.reqwest]
+version = "0.12"
+default-features = false
+features = ["rustls-tls", "json", "stream"]
+[dependencies.hickory-proto]
+version = "0.24"
+[dependencies.futures-util]
+version = "0.3"
