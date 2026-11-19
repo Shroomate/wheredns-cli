@@ -92,3 +92,27 @@ passed, 0 failed; Python: 10 offline review regressions passed; cargo build
 warnings all exit 0. Python fixture suite is configured in Linux CI; Rust fixtures
 run across the matrix. Native macOS/Windows runtime behavior remains unverified
 until their checks finish. No live diagnostics in this correction pass.
+
+## Re-review DNS eligibility corrections
+
+R1/R2: connector resolution now requires typed Outcome::NoError and IN (class 1)
+address records and CNAME links. RR class remains visible in DNS evidence;
+NXDOMAIN remains successful negative diagnostic evidence, but none of its records
+can supply connection addresses. Non-IN records are ignored for connector use.
+Conflicting IN CNAME/address evidence at one owner is rejected. Authoritative NS
+selection also requires NOERROR and matching owner/IN class.
+
+RED: new checked-in tests/dns_eligibility.py failed against 56791e4 for both A and
+AAAA NXDOMAIN-with-address, negative alias, CH/HS addresses, CH/HS aliases, and
+CH/HS terminal records (16 failing transport assertions). GREEN: 30 eligibility
+regressions passed: positive exact owner/CNAME, mixed IN/non-IN positives,
+NXDOMAIN addresses/aliases, SERVFAIL/REFUSED, CH/HS address and chain rejection,
+conflicting positive CNAME/address evidence, and legitimate empty NXDOMAIN/NODATA.
+Rejected evidence produced no HTTP connection. Fixtures use ephemeral loopback
+UDP/HTTP ports, including IPv6; no privileged port 53 or live service calls.
+The new suite runs in Linux CI alongside the original 10 regression cases.
+
+Final local validation: 9 Rust unit tests and 1 executable integration test passed;
+30 eligibility regressions and 10 original review regressions passed; fmt --check,
+clippy --locked --offline -- -D warnings, build --locked --offline and diff --check
+passed. No external diagnostics performed. No other feature scope added.

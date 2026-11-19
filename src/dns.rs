@@ -16,8 +16,14 @@ use tokio::{
 pub struct Record {
     pub name: String,
     pub rr_type: String,
+    pub rr_class: u16,
     pub ttl: u32,
     pub value: String,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum Outcome {
+    NoError,
+    NxDomain,
 }
 #[derive(Debug, Clone, Serialize)]
 pub struct Answer {
@@ -25,6 +31,7 @@ pub struct Answer {
     pub rr_type: String,
     pub server: String,
     pub status: String,
+    pub outcome: Outcome,
     pub authoritative: bool,
     pub records: Vec<Record>,
 }
@@ -91,6 +98,11 @@ pub async fn query(
         } else {
             m.response_code().to_string()
         },
+        outcome: if m.response_code() == hickory_proto::op::ResponseCode::NoError {
+            Outcome::NoError
+        } else {
+            Outcome::NxDomain
+        },
         authoritative: m.authoritative(),
         records: m
             .answers()
@@ -98,6 +110,7 @@ pub async fn query(
             .map(|r| Record {
                 name: r.name().to_string(),
                 rr_type: r.record_type().to_string(),
+                rr_class: u16::from(r.dns_class()),
                 ttl: r.ttl(),
                 value: r.data().map(ToString::to_string).unwrap_or_default(),
             })
@@ -116,6 +129,9 @@ fn validate(m: &Message, q: &Message) -> Result<(), String> {
 }
 impl Answer {
     pub fn addresses(&self) -> Result<Vec<IpAddr>, String> {
+        if self.outcome != Outcome::NoError {
+            return Ok(Vec::new());
+        }
         let canonical = |s: &str| s.trim_end_matches('.').to_ascii_lowercase();
         let mut owner = canonical(&self.name);
         let mut seen = std::collections::HashSet::new();
@@ -126,10 +142,19 @@ impl Answer {
             let aliases: Vec<_> = self
                 .records
                 .iter()
-                .filter(|r| canonical(&r.name) == owner && r.rr_type == "CNAME")
+                .filter(|r| r.rr_class == 1 && canonical(&r.name) == owner && r.rr_type == "CNAME")
                 .collect();
             if aliases.len() > 1 {
                 return Err("ambiguous CNAME".into());
+            }
+            if !aliases.is_empty()
+                && self.records.iter().any(|r| {
+                    r.rr_class == 1
+                        && canonical(&r.name) == owner
+                        && matches!(r.rr_type.as_str(), "A" | "AAAA")
+                })
+            {
+                return Err("CNAME conflicts with address evidence".into());
             }
             if let Some(alias) = aliases.first() {
                 owner = canonical(&alias.value);
@@ -138,7 +163,9 @@ impl Answer {
             return self
                 .records
                 .iter()
-                .filter(|r| canonical(&r.name) == owner && r.rr_type == self.rr_type)
+                .filter(|r| {
+                    r.rr_class == 1 && canonical(&r.name) == owner && r.rr_type == self.rr_type
+                })
                 .filter(|r| matches!(r.rr_type.as_str(), "A" | "AAAA"))
                 .map(|r| {
                     let ip: IpAddr = r.value.parse().map_err(|_| "invalid address RDATA")?;
@@ -219,6 +246,7 @@ mod hostile_tests {
         let rec = |n: &str, t: &str, v: &str| Record {
             name: n.into(),
             rr_type: t.into(),
+            rr_class: 1,
             ttl: 1,
             value: v.into(),
         };
@@ -227,6 +255,7 @@ mod hostile_tests {
             rr_type: "A".into(),
             server: "fixture".into(),
             status: "No Error".into(),
+            outcome: Outcome::NoError,
             authoritative: false,
             records: vec![
                 rec("unrelated.test", "A", "127.0.0.1"),

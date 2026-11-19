@@ -365,10 +365,19 @@ async fn check(a: &Args, host: &str, url: &reqwest::Url, kind: &str) -> Result<V
             let mut zone = host.to_string();
             let ns = loop {
                 let r = lookup(a, &zone, "NS", a.resolver, true).await?;
+                if r.outcome != dns::Outcome::NoError {
+                    return Err("no authoritative zone evidence".into());
+                }
                 let ns: Vec<_> = r
                     .records
                     .into_iter()
-                    .filter(|r| r.rr_type == "NS")
+                    .filter(|r| {
+                        r.rr_class == 1
+                            && r.rr_type == "NS"
+                            && r.name
+                                .trim_end_matches('.')
+                                .eq_ignore_ascii_case(zone.trim_end_matches('.'))
+                    })
                     .map(|r| r.value)
                     .collect();
                 if !ns.is_empty() {

@@ -20,7 +20,9 @@ jobs:
       - run: cargo build --locked
       - name: Offline review regressions
         if: runner.os == 'Linux'
-        run: python3 tests/review_regressions.py
+        run: |
+          python3 tests/review_regressions.py
+          python3 tests/dns_eligibility.py
       - run: cargo build --locked --release
 
       - uses: actions/upload-artifact@v4
