@@ -55,3 +55,40 @@ macOS ARM/Intel and Windows execution is untested locally. CI matrix builds/test
 and uploads native binaries; no release/deployment steps. Homebrew and Scoop
 are explicit unrendered templates requiring verified archives and SHA-256 hashes.
 Windows ZIP/WinGet preparation is documented. No release/package is published.
+
+## Independent review correctness fixes
+
+B1–B4 addressed directly in the parent thread, with one writer and no external
+diagnostic requests. The checked-in tests/review_regressions.py reproduces the
+review's packet and stdin fixtures without writing to the review artifact directory.
+RED on d152b5f: assertions failed for SERVFAIL, truncated TCP, malformed PTR,
+unrelated-owner HTTP connection, failed ping, invalid UTF-8, initial separator,
+and oversized whitespace. GREEN after fixes: 10 offline review regressions passed.
+
+Typed Result propagation now determines verdicts for DNS/email/subdomains, PTR
+and authoritative operations; failed subchecks fail the category (partial evidence
+is not retained). SERVFAIL/REFUSED and other resolver errors fail; NXDOMAIN/NODATA
+remain successful negative evidence. Failed ping reports bounded stdout/stderr in
+its error. TCP closed remains diagnostic evidence. HTTP non-success status fails.
+UDP envelope ID/question/QR/opcode is checked before TC fallback; final TCP TC is
+an incomplete-response error. IDs use the OS-seeded rand generator. A mismatched
+packet fails the query rather than being retried. Address records must match the
+queried family and owner, or an unambiguous bounded CNAME chain rooted there.
+Loops and overlong chains fail. Only those addresses enter destination policy and
+HTTP pinning. Header bytes are bounded before decoding, read/UTF-8 errors fail,
+and initial header/body separators are preserved.
+
+Additional offline tests cover happy TCP fallback, TCP TC, ID/question/opcode/QR
+mismatch, malformed/short frames, rejected UDP TC without TCP connection, negative
+RCODE controls, unrelated owner/type, CNAME positive/loop and mixed families,
+header read errors/leading continuation, address policy and macOS IPv6 ping6.
+The destination policy conservatively denies private, local, shared, documentation,
+benchmark and selected special/transition ranges; it is not an automatically
+updated IANA registry. Private opt-in applies to resolver and destination sockets.
+
+Final local verification: cargo test --locked --offline: 9 unit + 1 integration
+passed, 0 failed; Python: 10 offline review regressions passed; cargo build
+--locked --offline, cargo fmt --check and cargo clippy --locked --offline -- -D
+warnings all exit 0. Python fixture suite is configured in Linux CI; Rust fixtures
+run across the matrix. Native macOS/Windows runtime behavior remains unverified
+until their checks finish. No live diagnostics in this correction pass.

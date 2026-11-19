@@ -6,13 +6,12 @@ use serde::Serialize;
 use std::{
     net::{IpAddr, SocketAddr},
     str::FromStr,
-    sync::atomic::{AtomicU16, Ordering},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpStream, UdpSocket},
 };
-static ID: AtomicU16 = AtomicU16::new(1);
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Record {
     pub name: String,
@@ -36,7 +35,7 @@ pub async fn query(
     recurse: bool,
 ) -> Result<Answer, String> {
     let ty = RecordType::from_str(kind).map_err(|e| e.to_string())?;
-    let id = ID.fetch_add(1, Ordering::Relaxed);
+    let id = rand::random();
     let mut q = Message::new();
     q.set_id(id)
         .set_recursion_desired(recurse)
@@ -57,6 +56,7 @@ pub async fn query(
     let mut buf = vec![0; 65535];
     let n = socket.recv(&mut buf).await.map_err(|e| e.to_string())?;
     let mut m = Message::from_vec(&buf[..n]).map_err(|e| e.to_string())?;
+    validate(&m, &q)?;
     if m.truncated() {
         let mut tcp = TcpStream::connect(server)
             .await
@@ -70,11 +70,15 @@ pub async fn query(
         tcp.read_exact(&mut buf).await.map_err(|e| e.to_string())?;
         m = Message::from_vec(&buf).map_err(|e| e.to_string())?;
     }
-    if m.id() != id
-        || m.queries() != q.queries()
-        || m.message_type() != hickory_proto::op::MessageType::Response
-    {
-        return Err("DNS response mismatch".into());
+    validate(&m, &q)?;
+    if m.truncated() {
+        return Err("incomplete TCP DNS response".into());
+    }
+    if !matches!(
+        m.response_code(),
+        hickory_proto::op::ResponseCode::NoError | hickory_proto::op::ResponseCode::NXDomain
+    ) {
+        return Err(format!("DNS resolver failure: {}", m.response_code()));
     }
     Ok(Answer {
         name: name.into(),
@@ -99,6 +103,54 @@ pub async fn query(
             })
             .collect(),
     })
+}
+fn validate(m: &Message, q: &Message) -> Result<(), String> {
+    if m.id() != q.id()
+        || m.queries() != q.queries()
+        || m.message_type() != hickory_proto::op::MessageType::Response
+        || m.op_code() != q.op_code()
+    {
+        return Err("DNS response mismatch".into());
+    }
+    Ok(())
+}
+impl Answer {
+    pub fn addresses(&self) -> Result<Vec<IpAddr>, String> {
+        let canonical = |s: &str| s.trim_end_matches('.').to_ascii_lowercase();
+        let mut owner = canonical(&self.name);
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..=8 {
+            if !seen.insert(owner.clone()) {
+                return Err("CNAME loop".into());
+            }
+            let aliases: Vec<_> = self
+                .records
+                .iter()
+                .filter(|r| canonical(&r.name) == owner && r.rr_type == "CNAME")
+                .collect();
+            if aliases.len() > 1 {
+                return Err("ambiguous CNAME".into());
+            }
+            if let Some(alias) = aliases.first() {
+                owner = canonical(&alias.value);
+                continue;
+            }
+            return self
+                .records
+                .iter()
+                .filter(|r| canonical(&r.name) == owner && r.rr_type == self.rr_type)
+                .filter(|r| matches!(r.rr_type.as_str(), "A" | "AAAA"))
+                .map(|r| {
+                    let ip: IpAddr = r.value.parse().map_err(|_| "invalid address RDATA")?;
+                    if (r.rr_type == "A") != ip.is_ipv4() {
+                        return Err("address family mismatch".into());
+                    }
+                    Ok(ip)
+                })
+                .collect();
+        }
+        Err("CNAME chain exceeds eight links".into())
+    }
 }
 pub fn reverse(ip: IpAddr) -> String {
     match ip {
@@ -142,5 +194,186 @@ mod tests {
         let a = query("example.test", "A", addr, true).await.unwrap();
         assert_eq!(a.records[0].value, "192.0.2.1");
         assert_eq!(a.records[0].ttl, 60);
+    }
+}
+
+#[cfg(test)]
+mod hostile_tests {
+    use super::*;
+    use hickory_proto::op::{MessageType, OpCode, ResponseCode};
+    fn question() -> Message {
+        let mut q = Message::new();
+        q.set_id(123).add_query(Query::query(
+            Name::from_ascii("example.test.").unwrap(),
+            RecordType::A,
+        ));
+        q
+    }
+    fn response(q: &Message) -> Message {
+        let mut r = q.clone();
+        r.set_message_type(MessageType::Response);
+        r
+    }
+    #[test]
+    fn address_binding() {
+        let rec = |n: &str, t: &str, v: &str| Record {
+            name: n.into(),
+            rr_type: t.into(),
+            ttl: 1,
+            value: v.into(),
+        };
+        let mut a = Answer {
+            name: "example.test".into(),
+            rr_type: "A".into(),
+            server: "fixture".into(),
+            status: "No Error".into(),
+            authoritative: false,
+            records: vec![
+                rec("unrelated.test", "A", "127.0.0.1"),
+                rec("example.test", "TXT", "127.0.0.1"),
+            ],
+        };
+        assert!(a.addresses().unwrap().is_empty());
+        a.records.extend([
+            rec("EXAMPLE.test.", "CNAME", "alias.test."),
+            rec("alias.test.", "A", "1.1.1.1"),
+            rec("alias.test.", "AAAA", "::1"),
+        ]);
+        assert_eq!(
+            a.addresses().unwrap(),
+            vec!["1.1.1.1".parse::<IpAddr>().unwrap()]
+        );
+        a.records.push(rec("alias.test.", "CNAME", "example.test."));
+        assert!(a.addresses().is_err());
+    }
+    #[test]
+    fn envelope() {
+        let q = question();
+        let good = response(&q);
+        assert!(validate(&good, &q).is_ok());
+        for mode in 0..4 {
+            let mut r = good.clone();
+            match mode {
+                0 => {
+                    r.set_id(124);
+                }
+                1 => {
+                    r.set_op_code(OpCode::Status);
+                }
+                2 => {
+                    r.set_message_type(MessageType::Query);
+                }
+                _ => {
+                    r.queries_mut()[0].set_query_type(RecordType::MX);
+                }
+            }
+            assert!(validate(&r, &q).is_err());
+        }
+    }
+    #[tokio::test]
+    async fn tcp_frames() {
+        for mode in [
+            "good",
+            "tc",
+            "id",
+            "question",
+            "opcode",
+            "qr",
+            "short",
+            "malformed",
+            "udp_id",
+        ] {
+            let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let addr = udp.local_addr().unwrap();
+            let tcp = tokio::net::TcpListener::bind(addr).await.unwrap();
+            let task = tokio::spawn(async move {
+                let mut b = [0; 512];
+                let (n, p) = udp.recv_from(&mut b).await.unwrap();
+                let q = Message::from_vec(&b[..n]).unwrap();
+                let mut r = response(&q);
+                r.set_truncated(true);
+                if mode == "udp_id" {
+                    r.set_id(q.id().wrapping_add(1));
+                }
+                udp.send_to(&r.to_vec().unwrap(), p).await.unwrap();
+                if mode == "udp_id" {
+                    assert!(tokio::time::timeout(
+                        std::time::Duration::from_millis(50),
+                        tcp.accept()
+                    )
+                    .await
+                    .is_err());
+                    return;
+                }
+                let (mut socket, _) = tcp.accept().await.unwrap();
+                let n = socket.read_u16().await.unwrap();
+                let mut b = vec![0; n as usize];
+                socket.read_exact(&mut b).await.unwrap();
+                let mut r = response(&q);
+                match mode {
+                    "tc" => {
+                        r.set_truncated(true);
+                    }
+                    "id" => {
+                        r.set_id(q.id().wrapping_add(1));
+                    }
+                    "question" => {
+                        r.queries_mut()[0].set_query_type(RecordType::MX);
+                    }
+                    "opcode" => {
+                        r.set_op_code(OpCode::Status);
+                    }
+                    "qr" => {
+                        r.set_message_type(MessageType::Query);
+                    }
+                    _ => {}
+                }
+                let wire = if mode == "malformed" {
+                    vec![255; 3]
+                } else {
+                    r.to_vec().unwrap()
+                };
+                socket.write_u16(wire.len() as u16).await.unwrap();
+                if mode != "short" {
+                    socket.write_all(&wire).await.unwrap();
+                }
+            });
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                query("example.test.", "A", addr, true),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.is_ok(), mode == "good", "{mode}: {result:?}");
+            task.await.unwrap();
+        }
+    }
+    #[tokio::test]
+    async fn negative_statuses() {
+        for code in [
+            ResponseCode::NoError,
+            ResponseCode::NXDomain,
+            ResponseCode::ServFail,
+            ResponseCode::Refused,
+        ] {
+            let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let addr = udp.local_addr().unwrap();
+            tokio::spawn(async move {
+                let mut b = [0; 512];
+                let (n, p) = udp.recv_from(&mut b).await.unwrap();
+                let q = Message::from_vec(&b[..n]).unwrap();
+                let mut r = response(&q);
+                r.set_response_code(code);
+                udp.send_to(&r.to_vec().unwrap(), p).await.unwrap();
+            });
+            let r = query("example.test.", "A", addr, true).await;
+            assert_eq!(
+                r.is_ok(),
+                matches!(code, ResponseCode::NoError | ResponseCode::NXDomain)
+            );
+            if code == ResponseCode::NoError {
+                assert_eq!(r.unwrap().status, "NODATA");
+            }
+        }
     }
 }

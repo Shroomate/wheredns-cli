@@ -25,3 +25,12 @@ Exit codes: 0 completed checks, 1 diagnostic error, 2 invalid input, 130 cancell
 or aggregate deadline. DNS negatives remain evidence. Plain output is formatted
 evidence with labels; JSON is versioned. Neither emits ANSI.
 See docs/COMPLETION.md for exact coverage and packaging/README.md for release steps.
+
+Resolver failures (including SERVFAIL/REFUSED), failed PTR/authoritative subchecks
+and nonzero OS ping exits fail the category with exit 1. NXDOMAIN and NODATA remain
+negative evidence with exit 0. Headers require valid UTF-8 within 64 KiB of raw
+input; read/encoding/size errors exit 2. An initial blank line ends the headers.
+Destination policy conservatively denies selected special/transition ranges as
+well as private/local addresses; it is not an automatically updated registry.
+macOS IPv6 ICMP selects ping6. Run the offline review suite after cargo build:
+`python3 tests/review_regressions.py` (loopback fixtures, no external diagnostics).

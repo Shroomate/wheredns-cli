@@ -73,6 +73,10 @@ fn public(ip: IpAddr) -> bool {
                 || a.is_multicast()
                 || o[0] == 0
                 || o[0] >= 224
+                || (o[0] == 192 && o[1] == 0)
+                || (o[0] == 192 && o[1] == 168)
+                || (o[0] == 198 && (o[1] == 18 || o[1] == 19 || (o[1] == 51 && o[2] == 100)))
+                || (o[0] == 203 && o[1] == 0 && o[2] == 113)
                 || (o[0] == 100 && o[1] & 192 == 64))
         }
         IpAddr::V6(a) => {
@@ -82,6 +86,11 @@ fn public(ip: IpAddr) -> bool {
                 || a.is_multicast()
                 || s[0] & 0xfe00 == 0xfc00
                 || s[0] & 0xffc0 == 0xfe80
+                || s[0] & 0xffc0 == 0xfec0
+                || (a.to_ipv4_mapped().is_none()
+                    && (s[0] & 0xe000 != 0x2000
+                        || (s[0] == 0x2001 && (s[1] < 0x0200 || s[1] == 0xdb8))
+                        || s[0] == 0x2002))
                 || a.to_ipv4_mapped().is_some_and(|v| !public(IpAddr::V4(v))))
         }
     }
@@ -138,11 +147,7 @@ async fn addresses(a: &Args, host: &str) -> Result<Vec<IpAddr>, String> {
     } else {
         for ty in ["A", "AAAA"] {
             let r = lookup(a, host, ty, a.resolver, true).await?;
-            for rr in r.records {
-                if let Ok(ip) = rr.value.parse() {
-                    ips.push(ip)
-                }
-            }
+            ips.extend(r.addresses()?);
         }
     }
     if ips.is_empty() {
@@ -221,9 +226,30 @@ async fn http(a: &Args, mut url: reqwest::Url, body: bool) -> Result<Value, Stri
         } else {
             Value::Null
         };
-        return Ok(json!({"hops":hops,"body":data,"http_success":status.is_success()}));
+        if !status.is_success() {
+            return Err(format!("HTTP status {status}"));
+        }
+        return Ok(json!({"hops":hops,"body":data,"http_success":true}));
     }
     Err("redirect limit exceeded".into())
+}
+fn ping_program(os: &str, ip: IpAddr) -> &'static str {
+    if os == "macos" && ip.is_ipv6() {
+        "ping6"
+    } else {
+        "ping"
+    }
+}
+fn read_headers(reader: impl Read) -> Result<String, String> {
+    let mut bytes = Vec::new();
+    reader
+        .take(65537)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("header input: {e}"))?;
+    if bytes.len() > 65536 {
+        return Err("headers exceed 64 KiB".into());
+    }
+    String::from_utf8(bytes).map_err(|_| "headers require UTF-8".into())
 }
 fn parse_headers(raw: &str) -> Value {
     let mut unfolded = String::new();
@@ -231,7 +257,7 @@ fn parse_headers(raw: &str) -> Value {
         if line.is_empty() {
             break;
         }
-        if line.starts_with([' ', '\t']) {
+        if line.starts_with([' ', '\t']) && !unfolded.is_empty() {
             unfolded.push(' ');
             unfolded.push_str(line.trim());
         } else {
@@ -268,12 +294,10 @@ async fn check(a: &Args, host: &str, url: &reqwest::Url, kind: &str) -> Result<V
             });
             let rows: Vec<_> = stream::iter(tasks)
                 .buffered(a.concurrency as usize)
-                .map(|r| match r {
-                    Ok(v) => json!(v),
-                    Err(e) => json!({"error":e}),
-                })
-                .collect()
-                .await;
+                .collect::<Vec<_>>()
+                .await
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()?;
             Ok(json!({"queries":rows}))
         }
         "email" => {
@@ -298,12 +322,10 @@ async fn check(a: &Args, host: &str, url: &reqwest::Url, kind: &str) -> Result<V
             let rows: Vec<_> =
                 stream::iter(names.iter().map(|(n, t)| lookup(a, n, t, a.resolver, true)))
                     .buffered(a.concurrency as usize)
-                    .map(|r| match r {
-                        Ok(v) => json!(v),
-                        Err(e) => json!({"error":e}),
-                    })
-                    .collect()
-                    .await;
+                    .collect::<Vec<_>>()
+                    .await
+                    .into_iter()
+                    .collect::<Result<Vec<_>, _>>()?;
             Ok(
                 json!({"queries":rows,"scope":"DNS policy evidence; no delivery or signature validation"}),
             )
@@ -335,7 +357,7 @@ async fn check(a: &Args, host: &str, url: &reqwest::Url, kind: &str) -> Result<V
             let ips = addresses(a, host).await?;
             let mut rows = vec![];
             for ip in ips.iter().take(4) {
-                rows.push(json!({"ip":ip,"reverse":lookup(a,&dns::reverse(*ip),"PTR",a.resolver,true).await.map_err(|e|e.to_string())}));
+                rows.push(json!({"ip":ip,"reverse":lookup(a,&dns::reverse(*ip),"PTR",a.resolver,true).await?}));
             }
             Ok(json!({"addresses":rows}))
         }
@@ -363,11 +385,11 @@ async fn check(a: &Args, host: &str, url: &reqwest::Url, kind: &str) -> Result<V
                 match addresses(a, name).await {
                     Ok(ips) => {
                         let server = SocketAddr::new(ips[0], 53);
-                        let answer = lookup(a, host, "A", server, false).await;
-                        let soa = lookup(a, &zone, "SOA", server, false).await;
+                        let answer = lookup(a, host, "A", server, false).await?;
+                        let soa = lookup(a, &zone, "SOA", server, false).await?;
                         rows.push(json!({"server":name,"answer":answer,"soa":soa}));
                     }
-                    Err(e) => rows.push(json!({"server":name,"error":e})),
+                    Err(e) => return Err(e),
                 }
             }
             Ok(
@@ -408,21 +430,20 @@ async fn check(a: &Args, host: &str, url: &reqwest::Url, kind: &str) -> Result<V
             let wildcard = lookup(a, &control, "A", a.resolver, true).await?;
             let rows = stream::iter(labels.iter().map(|n| async move {
                 let name = format!("{n}.{host}");
-                match lookup(a, &name, "A", a.resolver, true).await {
-                    Ok(v) => json!(v),
-                    Err(e) => json!({"name":name,"error":e}),
-                }
+                lookup(a, &name, "A", a.resolver, true).await
             }))
             .buffered(a.concurrency as usize)
             .collect::<Vec<_>>()
-            .await;
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?;
             Ok(
                 json!({"wildcard_control":wildcard,"queries":rows,"scope":"20 common names, A only; not exhaustive discovery"}),
             )
         }
         "ping" => {
             let ips = addresses(a, host).await?;
-            let mut c = tokio::process::Command::new("ping");
+            let mut c = tokio::process::Command::new(ping_program(std::env::consts::OS, ips[0]));
             c.args([
                 if cfg!(windows) { "-n" } else { "-c" },
                 "3",
@@ -433,8 +454,15 @@ async fn check(a: &Args, host: &str, url: &reqwest::Url, kind: &str) -> Result<V
                 .await
                 .map_err(|_| "ping timeout")?
                 .map_err(|e| e.to_string())?;
+            if !out.status.success() {
+                return Err(format!(
+                    "ping failed: {}{}",
+                    String::from_utf8_lossy(&out.stdout[..out.stdout.len().min(65536)]),
+                    String::from_utf8_lossy(&out.stderr[..out.stderr.len().min(65536)])
+                ));
+            }
             Ok(
-                json!({"success":out.status.success(),"raw":String::from_utf8_lossy(&out.stdout[..out.stdout.len().min(65536)])}),
+                json!({"success":true,"raw":String::from_utf8_lossy(&out.stdout[..out.stdout.len().min(65536)])}),
             )
         }
         _ => Err(format!("unknown check: {kind}")),
@@ -458,22 +486,15 @@ async fn main() {
         eprintln!("target required; use headers for stdin");
         std::process::exit(2);
     }
-    let raw = a.target.clone().unwrap_or_else(|| {
-        let mut s = String::new();
-        let _ = io::stdin().take(65537).read_to_string(&mut s);
-        s.trim().to_string()
-    });
+    let raw = a.target.clone().unwrap_or_default();
     if a.check == "headers" {
-        let mut s = String::new();
-        if a.target.is_some() {
-            let _ = io::stdin().take(65537).read_to_string(&mut s);
-        } else {
-            s = raw
-        }
-        if s.len() > 65536 {
-            eprintln!("headers exceed 64 KiB");
-            std::process::exit(2);
-        }
+        let s = match read_headers(io::stdin()) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(2);
+            }
+        };
         let v = parse_headers(&s);
         println!(
             "{}",
@@ -515,8 +536,7 @@ async fn main() {
             rows.push(match r {
                 Ok(data) => Row {
                     check: kind.into(),
-                    ok: !data.to_string().contains("\"error\":")
-                        && data.get("http_success") != Some(&Value::Bool(false)),
+                    ok: true,
                     data,
                     error: None,
                 },
@@ -569,6 +589,37 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn raw_headers_and_platform_policy() {
+        assert!(read_headers(&vec![b' '; 65537][..]).is_err());
+        assert!(read_headers(&b"Subject: x\n\xff"[..]).is_err());
+        struct Broken;
+        impl Read for Broken {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::other("fixture"))
+            }
+        }
+        assert!(read_headers(Broken).is_err());
+        assert_eq!(parse_headers("\nSubject: body")["fields"], json!([]));
+        assert_eq!(parse_headers(" orphan\nSubject: x")["malformed_lines"], 1);
+        for ip in [
+            "fec0::1",
+            "2001:db8::1",
+            "2002::1",
+            "192.0.2.1",
+            "198.18.0.1",
+            "203.0.113.1",
+            "::ffff:10.0.0.1",
+        ] {
+            assert!(!public(ip.parse().unwrap()), "{ip}");
+        }
+        for ip in ["1.1.1.1", "2606:4700:4700::1111"] {
+            assert!(public(ip.parse().unwrap()));
+        }
+        assert_eq!(ping_program("macos", "::1".parse().unwrap()), "ping6");
+        assert_eq!(ping_program("linux", "::1".parse().unwrap()), "ping");
+        assert_eq!(ping_program("windows", "::1".parse().unwrap()), "ping");
+    }
     #[test]
     fn url_normalization() {
         assert_eq!(
