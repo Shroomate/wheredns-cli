@@ -37,7 +37,7 @@ fn cli_contract() {
     let out = child.wait_with_output().unwrap();
     assert!(out.status.success());
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(v["schema_version"], 1);
+    assert_eq!(v["schema_version"], 2);
     assert_eq!(v["fields"][0]["value"], "folded continuation");
     assert_eq!(v["fields"].as_array().unwrap().len(), 3);
     assert!(!out.stdout.contains(&27));
@@ -61,9 +61,12 @@ fn terminal_headers_show_readable_fields() {
     assert!(output.status.success());
     assert!(!output.stdout.contains(&27));
     let report = String::from_utf8(output.stdout).unwrap();
-    assert!(report.starts_with("Email headers\n"));
-    assert!(report.contains("  subject: Hello\n"));
-    assert!(report.contains("  x-color: \\u{1b}[32m\n"));
+    assert!(report.starts_with("╭┤headers email header trace├"));
+    assert!(report.contains("│ subject       Hello"));
+    // Control characters from the message are shown escaped, never emitted raw.
+    assert!(report.contains("x-color"));
+    assert!(report.contains("\\u{1b}[32m"));
+    assert!(!report.lines().any(|l| l.ends_with(' ')));
 }
 
 #[test]
@@ -256,9 +259,10 @@ async fn terminal_dns_groups_queries_and_records() {
     .await;
     assert!(out.status.success());
     let report = String::from_utf8(out.stdout).unwrap();
-    assert!(report.starts_with("example.test  ("));
-    assert!(report.contains("\nDNS  [OK]\n"));
-    assert!(report.contains("    example.test.  60s  IN  A  192.0.2.1\n"));
-    assert!(report.contains("  AAAA  example.test  [NODATA]\n"));
-    assert!(report.contains("    No records returned\n"));
+    assert!(report.starts_with("wheredns v"));
+    assert!(report.contains("╭┤⁶dns "));
+    assert!(report.contains("│ A           60  192.0.2.1 "));
+    assert!(report.contains("│ AAAA         -  -- no record "));
+    assert!(report.contains("1/1 checks ok"));
+    assert!(!report.contains('\x1b'));
 }

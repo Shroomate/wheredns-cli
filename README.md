@@ -52,30 +52,68 @@ Run `cargo uninstall wheredns` to remove the installed binary.
 
 ## Usage
 
-WhereDNS shows a themed report in Terminal. Use `--theme` with `purple` (the
-default), `tty`, `btop`, `phosphor`, or `amber`. Set `NO_COLOR=1` for
-monochrome panels. Add `--json` for scripts and other tools.
+Give WhereDNS a domain, IP address or URL, then any checks you want. With no
+checks, a domain runs `where email ping whois web` (the same default as the
+WhereDNS website) and an IP runs `ping whois web ip`. Checks run concurrently
+and each panel prints as soon as it is ready.
 
-    wheredns example.com
-    wheredns example.com dns A MX --json
-    wheredns example.com email --selectors google
-    wheredns https://example.com/path web
-    wheredns example.com propagation
-    wheredns example.com subdomains
-    wheredns 1.1.1.1 ping
-    wheredns 127.0.0.1 tcp --ports 80,443 --allow-private
-    cat message.eml | wheredns headers --json
+    wheredns github.com
+    wheredns google.com email dkim:20230601
+    wheredns example.com dns A MX TXT propagation
+    wheredns 8.8.8.8 blacklist ip
+    wheredns cloudflare.com web ports 22 443 8443
+    wheredns example.com all
+    pbpaste | wheredns headers
 
-DNS, HTTP and RDAP are native Rust. ICMP requires OS ping. No hosted WhereDNS
-service, account, CAPTCHA or remote auth dependency. External DNS/RDAP/target
-servers receive diagnostic requests. No telemetry or result persistence.
-Private destinations and private resolvers require --allow-private. No subnet
-scanning. HTTP destinations are checked and pinned at each redirect; proxies
-are disabled. DNS defaults to 1.1.1.1:53; override with --resolver.
+| Check | Evidence |
+|---|---|
+| `where` | DNS hosting provider, domain registrar, IP network owner |
+| `email` | MX, SPF, DMARC, DKIM, MTA-STS, TLS-RPT and BIMI with lint notes |
+| `ping` | Ten ICMP echoes with a latency chart, loss and min/avg/max |
+| `whois` | RDAP registration: registrar, dates, status, nameservers, DNSSEC |
+| `web` | Status, redirects, DNS/TCP/TLS/response timing, certificate, HSTS, HTTP→HTTPS |
+| `dns [TYPES]` | 14 record types plus SRV/TLSA presets, or the types you name; DNSSEC AD flag |
+| `blacklist` | The IP (or the domain's mail servers) on 14 public DNS blocklists |
+| `ip` | Reverse DNS with forward confirmation, ASN, BGP prefix, network owner |
+| `ports [N…]` | Common TCP ports, or up to ten you name |
+| `propagation` | Each authoritative nameserver queried directly; answers and SOA serials compared |
+| `subdomains` | Twenty common names with randomized wildcard controls |
+| `dkim:SEL` | Email check using that DKIM selector |
+| `headers` | Email header from stdin: hop trace with delays and authentication results |
 
-Exit codes: 0 completed checks, 1 diagnostic error, 2 invalid input, 130 cancellation
-or aggregate deadline. DNS negatives remain evidence. Redirected output uses
-plain text by default. JSON is versioned and contains no ANSI escape sequences.
+On a terminal the report is live, like the website: each check gets a panel
+while it runs, ping replies, port probes and blocklist answers stream in, and
+finished panels slide in with bars that grow to their measured size. Panels
+fill the terminal width and re-lay out if you resize the window during a run.
+
+Themes match the website: `btop` (default), `tty`, `purple`, `phosphor` and
+`amber`. Save your preferences once with `wheredns config`:
+
+```sh
+wheredns config                          # show settings and the file path
+wheredns config set theme tty
+wheredns config set checks where web dns # default checks for a domain
+wheredns config set animate minimal      # full (default), minimal or off
+wheredns config set background false     # keep the terminal's own background
+wheredns config unset theme
+```
+
+Settings live in `~/.config/wheredns/config` (`$XDG_CONFIG_HOME` is honored).
+`--theme`/`--animate` beat `WHEREDNS_THEME`/`WHEREDNS_ANIMATE`, which beat the
+file. `NO_COLOR=1` turns colors off. Add `--json` for scripts; output that is
+not a terminal is plain text with no escape sequences or animation.
+
+Everything runs from your machine. DNS, HTTP, TLS and RDAP are native Rust; ICMP
+uses the OS `ping`. There is no hosted WhereDNS service, account or telemetry,
+and nothing is stored. External DNS, RDAP and target servers receive the
+diagnostic requests. Private destinations and resolvers require
+`--allow-private`. HTTP destinations are resolved, checked and pinned at every
+redirect, and proxies are disabled. DNS defaults to 1.1.1.1:53; override with
+`--resolver`.
+
+Exit codes: 0 every check completed, 1 a check failed, 2 invalid input, 130
+cancellation or aggregate deadline. JSON output is versioned (`schema_version`
+2) and contains no ANSI escape sequences.
 See docs/COMPLETION.md for exact coverage and packaging/README.md for release steps.
 
 Resolver failures (including SERVFAIL/REFUSED), failed PTR/authoritative subchecks

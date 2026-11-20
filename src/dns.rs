@@ -41,6 +41,8 @@ pub struct Answer {
     pub status: String,
     pub outcome: Outcome,
     pub authoritative: bool,
+    /// Resolver set the AD flag: it validated DNSSEC for this response.
+    pub authenticated: bool,
     pub records: Vec<Record>,
 }
 pub async fn query(
@@ -54,6 +56,7 @@ pub async fn query(
     let mut q = Message::new();
     q.set_id(id)
         .set_recursion_desired(recurse)
+        .set_authentic_data(recurse)
         .add_query(Query::query(
             Name::from_ascii(name).map_err(|e| e.to_string())?,
             ty,
@@ -106,6 +109,7 @@ pub async fn query(
             Outcome::NxDomain
         },
         authoritative: m.authoritative(),
+        authenticated: m.authentic_data(),
         records: m
             .answers()
             .iter()
@@ -114,10 +118,66 @@ pub async fn query(
                 rr_type: r.record_type().to_string(),
                 rr_class: u16::from(r.dns_class()),
                 ttl: r.ttl(),
-                value: r.data().map(ToString::to_string).unwrap_or_default(),
+                value: r.data().map(render).unwrap_or_default(),
             })
             .collect(),
     })
+}
+
+/// Presentation format for record data, including DNSSEC types hickory leaves opaque.
+fn render(data: &RData) -> String {
+    match data {
+        RData::Unknown { code, rdata } => {
+            let b = rdata.anything();
+            match (u16::from(*code), b.len() >= 4) {
+                // DS / CDS: key tag, algorithm, digest type, digest (hex)
+                (43 | 59, true) => format!(
+                    "{} {} {} {}",
+                    u16::from_be_bytes([b[0], b[1]]),
+                    b[2],
+                    b[3],
+                    b[4..]
+                        .iter()
+                        .map(|x| format!("{x:02X}"))
+                        .collect::<String>()
+                ),
+                // DNSKEY / CDNSKEY: flags, protocol, algorithm, key (base64)
+                (48 | 60, true) => format!(
+                    "{} {} {} {}",
+                    u16::from_be_bytes([b[0], b[1]]),
+                    b[2],
+                    b[3],
+                    base64(&b[4..])
+                ),
+                _ => data.to_string(),
+            }
+        }
+        RData::HTTPS(_) | RData::SVCB(_) => data
+            .to_string()
+            .split_whitespace()
+            .map(|t| t.trim_end_matches(','))
+            .collect::<Vec<_>>()
+            .join(" "),
+        _ => data.to_string(),
+    }
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for c in bytes.chunks(3) {
+        let n = (c[0] as u32) << 16
+            | (*c.get(1).unwrap_or(&0) as u32) << 8
+            | *c.get(2).unwrap_or(&0) as u32;
+        for i in 0..4 {
+            if i <= c.len() {
+                out.push(T[(n >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
 }
 
 fn response_status(message: &Message, question: &Query) -> String {
@@ -175,6 +235,52 @@ fn validate(m: &Message, q: &Message) -> Result<(), String> {
     Ok(())
 }
 impl Answer {
+    /// "answered", "nodata" or "nxdomain", as the website reports lookup outcomes.
+    pub fn kind(&self) -> &'static str {
+        if self.outcome == Outcome::NxDomain {
+            "nxdomain"
+        } else if self.status == "NODATA" || self.status == "REFERRAL" {
+            "nodata"
+        } else {
+            "answered"
+        }
+    }
+
+    /// IN-class record values of the requested type, at any owner in the answer.
+    pub fn values(&self) -> Vec<String> {
+        self.records
+            .iter()
+            .filter(|r| r.rr_class == 1 && r.rr_type == self.rr_type)
+            .map(|r| r.value.clone())
+            .collect()
+    }
+
+    /// IN-class values of the requested type owned by `owner`.
+    pub fn values_at(&self, owner: &str) -> Vec<String> {
+        let owner = owner.trim_end_matches('.').to_ascii_lowercase();
+        self.records
+            .iter()
+            .filter(|r| {
+                r.rr_class == 1
+                    && r.rr_type == self.rr_type
+                    && r.name.trim_end_matches('.').eq_ignore_ascii_case(&owner)
+            })
+            .map(|r| r.value.clone())
+            .collect()
+    }
+
+    /// CNAME targets followed by the resolver.
+    pub fn chain(&self) -> Vec<String> {
+        if self.rr_type == "CNAME" {
+            return Vec::new();
+        }
+        self.records
+            .iter()
+            .filter(|r| r.rr_type == "CNAME")
+            .map(|r| r.value.trim_end_matches('.').to_string())
+            .collect()
+    }
+
     pub fn addresses(&self) -> Result<Vec<IpAddr>, String> {
         if self.outcome != Outcome::NoError {
             return Ok(Vec::new());
@@ -304,6 +410,7 @@ mod hostile_tests {
             status: "No Error".into(),
             outcome: Outcome::NoError,
             authoritative: false,
+            authenticated: false,
             records: vec![
                 rec("unrelated.test", "A", "127.0.0.1"),
                 rec("example.test", "TXT", "127.0.0.1"),
