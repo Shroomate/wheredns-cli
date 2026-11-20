@@ -44,6 +44,29 @@ fn cli_contract() {
 }
 
 #[test]
+fn terminal_headers_show_readable_fields() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_wheredns"))
+        .arg("headers")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"Subject: Hello\r\nX-Color: \x1b[32m\r\n\r\n")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    assert!(!output.stdout.contains(&27));
+    let report = String::from_utf8(output.stdout).unwrap();
+    assert!(report.starts_with("Email headers\n"));
+    assert!(report.contains("  subject: Hello\n"));
+    assert!(report.contains("  x-color: \\u{1b}[32m\n"));
+}
+
+#[test]
 fn invalid_checks_and_record_types_are_usage_errors() {
     let bin = env!("CARGO_BIN_EXE_wheredns");
     for args in [
@@ -132,14 +155,7 @@ async fn run_with_dns(
     command
         .arg(target)
         .args(check)
-        .args([
-            "--json",
-            "--allow-private",
-            "--resolver",
-            &resolver,
-            "--timeout",
-            "2",
-        ])
+        .args(["--allow-private", "--resolver", &resolver, "--timeout", "2"])
         .kill_on_drop(true);
     let output = command.output();
     tokio::pin!(output);
@@ -166,18 +182,22 @@ async fn propagation_looks_up_parent_zone_after_nxdomain() {
     let target = Name::from_ascii("missing.example.test.").unwrap();
     let zone = Name::from_ascii("example.test.").unwrap();
     let server = Name::from_ascii("ns.example.test.").unwrap();
-    let (out, queries) = run_with_dns("missing.example.test", &["propagation"], |response| {
-        let name = response.queries()[0].name();
-        if name == &zone {
-            response.add_answer(Record::from_rdata(
-                zone.clone(),
-                60,
-                RData::NS(hickory_proto::rr::rdata::NS(server.clone())),
-            ));
-        } else {
-            response.set_response_code(ResponseCode::NXDomain);
-        }
-    })
+    let (out, queries) = run_with_dns(
+        "missing.example.test",
+        &["propagation", "--json"],
+        |response| {
+            let name = response.queries()[0].name();
+            if name == &zone {
+                response.add_answer(Record::from_rdata(
+                    zone.clone(),
+                    60,
+                    RData::NS(hickory_proto::rr::rdata::NS(server.clone())),
+                ));
+            } else {
+                response.set_response_code(ResponseCode::NXDomain);
+            }
+        },
+    )
     .await;
     assert_eq!(
         out.status.code(),
@@ -191,7 +211,7 @@ async fn propagation_looks_up_parent_zone_after_nxdomain() {
 
 #[tokio::test]
 async fn dns_labels_cname_without_requested_record_as_nodata() {
-    let (out, _) = run_with_dns("www.example.test", &["dns", "AAAA"], |response| {
+    let (out, _) = run_with_dns("www.example.test", &["dns", "AAAA", "--json"], |response| {
         let zone = Name::from_ascii("example.test.").unwrap();
         response.add_answer(Record::from_rdata(
             response.queries()[0].name().clone(),
@@ -219,4 +239,26 @@ async fn dns_labels_cname_without_requested_record_as_nodata() {
         report["results"][0]["data"]["queries"][0]["status"],
         "NODATA"
     );
+}
+
+#[tokio::test]
+async fn terminal_dns_groups_queries_and_records() {
+    let (out, _) = run_with_dns("example.test", &["dns", "A", "AAAA"], |response| {
+        let question = &response.queries()[0];
+        if question.query_type() == RecordType::A {
+            response.add_answer(Record::from_rdata(
+                question.name().clone(),
+                60,
+                RData::A(hickory_proto::rr::rdata::A::new(192, 0, 2, 1)),
+            ));
+        }
+    })
+    .await;
+    assert!(out.status.success());
+    let report = String::from_utf8(out.stdout).unwrap();
+    assert!(report.starts_with("example.test  ("));
+    assert!(report.contains("\nDNS  [OK]\n"));
+    assert!(report.contains("    example.test.  60s  IN  A  192.0.2.1\n"));
+    assert!(report.contains("  AAAA  example.test  [NODATA]\n"));
+    assert!(report.contains("    No records returned\n"));
 }

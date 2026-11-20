@@ -52,6 +52,10 @@ Run `cargo uninstall wheredns` to remove the installed binary.
 
 ## Usage
 
+WhereDNS shows a themed report in Terminal. Use `--theme` with `purple` (the
+default), `tty`, `btop`, `phosphor`, or `amber`. Set `NO_COLOR=1` for
+monochrome panels. Add `--json` for scripts and other tools.
+
     wheredns example.com
     wheredns example.com dns A MX --json
     wheredns example.com email --selectors google
@@ -70,8 +74,8 @@ scanning. HTTP destinations are checked and pinned at each redirect; proxies
 are disabled. DNS defaults to 1.1.1.1:53; override with --resolver.
 
 Exit codes: 0 completed checks, 1 diagnostic error, 2 invalid input, 130 cancellation
-or aggregate deadline. DNS negatives remain evidence. Plain output is formatted
-evidence with labels; JSON is versioned. Neither emits ANSI.
+or aggregate deadline. DNS negatives remain evidence. Redirected output uses
+plain text by default. JSON is versioned and contains no ANSI escape sequences.
 See docs/COMPLETION.md for exact coverage and packaging/README.md for release steps.
 
 Resolver failures (including SERVFAIL/REFUSED), failed PTR/authoritative subchecks

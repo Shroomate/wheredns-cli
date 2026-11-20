@@ -1,3 +1,4 @@
+mod display;
 mod dns;
 use clap::Parser;
 use futures_util::{stream, StreamExt};
@@ -28,6 +29,9 @@ struct Args {
     records: Vec<String>,
     #[arg(long)]
     json: bool,
+    /// Color palette for the terminal report
+    #[arg(long, value_enum, default_value = "purple")]
+    theme: display::Theme,
     #[arg(long)]
     allow_private: bool,
     #[arg(long,default_value_t=5,value_parser=clap::value_parser!(u64).range(1..=30))]
@@ -545,7 +549,7 @@ async fn main() {
             if a.json {
                 serde_json::to_string(&v).unwrap()
             } else {
-                serde_json::to_string_pretty(&v).unwrap()
+                display::headers(&v, a.theme)
             }
         );
         return;
@@ -609,24 +613,7 @@ async fn main() {
         if a.json {
             serde_json::to_string(&report).unwrap()
         } else {
-            report
-                .results
-                .iter()
-                .map(|r| {
-                    let status = if r.ok { "completed" } else { "failed" };
-                    let mut output = format!("{}: {status}", r.check);
-                    if let Some(error) = &r.error {
-                        output.push('\n');
-                        output.push_str(error);
-                    }
-                    if r.ok || !r.data.is_null() {
-                        output.push('\n');
-                        output.push_str(&serde_json::to_string_pretty(&r.data).unwrap());
-                    }
-                    output
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
+            display::report(&report, a.theme)
         }
     );
     if !ok {
