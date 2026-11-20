@@ -1,8 +1,55 @@
 # WhereDNS CLI
 
-Standalone Rust local diagnostics. Build with stable Rust: `cargo build --locked`.
+WhereDNS is a standalone Rust CLI for local DNS, email, registration, and
+network diagnostics.
 
-Examples:
+## Install on macOS
+
+Build WhereDNS from source with a current stable Rust toolchain and Apple's
+command-line developer tools. If you already have Xcode or its command-line
+tools, skip `xcode-select --install`. If you already have Cargo, skip the Rust
+installation step.
+
+1. Install [Apple's Command Line Tools](https://developer.apple.com/documentation/xcode/installing-the-command-line-tools/).
+
+   ```sh
+   xcode-select --install
+   ```
+
+2. Install Rust using [rustup](https://rustup.rs/), or run the following if you
+   already use Homebrew.
+
+   ```sh
+   brew install rust
+   ```
+
+3. Clone the repository and install with the checked-in dependency lockfile.
+   If you already have a checkout, run the install command from its root.
+
+   ```sh
+   git clone https://github.com/Shroomate/wheredns-cli.git
+   cd wheredns-cli
+   cargo install --path . --locked
+   ```
+
+4. Verify the installation. These commands work offline.
+
+   ```sh
+   wheredns --version
+   wheredns --help
+   ```
+
+   If your shell reports `command not found`, add Cargo's default binary
+   directory to your PATH. Run this in your current shell and add the same
+   line to `~/.zshrc` to use it in new Terminal sessions.
+
+   ```sh
+   export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
+   ```
+
+Run `cargo uninstall wheredns` to remove the installed binary.
+
+## Usage
 
     wheredns example.com
     wheredns example.com dns A MX --json
