@@ -1,5 +1,36 @@
 # WhereDNS CLI
 
-Standalone local network diagnostics for macOS, Windows and Linux. This project is separate from the WhereDNS hosted website and does not require its service or probe.
+Standalone Rust local diagnostics. Build with stable Rust: `cargo build --locked`.
 
-Implementation is under development. Homebrew distribution and native Windows releases are targets, not currently published packages.
+Examples:
+
+    wheredns example.com
+    wheredns example.com dns A MX --json
+    wheredns example.com email --selectors google
+    wheredns https://example.com/path web
+    wheredns example.com propagation
+    wheredns example.com subdomains
+    wheredns 1.1.1.1 ping
+    wheredns 127.0.0.1 tcp --ports 80,443 --allow-private
+    cat message.eml | wheredns headers --json
+
+DNS, HTTP and RDAP are native Rust. ICMP requires OS ping. No hosted WhereDNS
+service, account, CAPTCHA or remote auth dependency. External DNS/RDAP/target
+servers receive diagnostic requests. No telemetry or result persistence.
+Private destinations and private resolvers require --allow-private. No subnet
+scanning. HTTP destinations are checked and pinned at each redirect; proxies
+are disabled. DNS defaults to 1.1.1.1:53; override with --resolver.
+
+Exit codes: 0 completed checks, 1 diagnostic error, 2 invalid input, 130 cancellation
+or aggregate deadline. DNS negatives remain evidence. Plain output is formatted
+evidence with labels; JSON is versioned. Neither emits ANSI.
+See docs/COMPLETION.md for exact coverage and packaging/README.md for release steps.
+
+Resolver failures (including SERVFAIL/REFUSED), failed PTR/authoritative subchecks
+and nonzero OS ping exits fail the category with exit 1. NXDOMAIN and NODATA remain
+negative evidence with exit 0. Headers require valid UTF-8 within 64 KiB of raw
+input; read/encoding/size errors exit 2. An initial blank line ends the headers.
+Destination policy conservatively denies selected special/transition ranges as
+well as private/local addresses; it is not an automatically updated registry.
+macOS IPv6 ICMP selects ping6. Run the offline review suite after cargo build:
+`python3 tests/review_regressions.py` (loopback fixtures, no external diagnostics).

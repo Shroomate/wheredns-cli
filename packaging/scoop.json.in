@@ -1,0 +1,10 @@
+{
+  "version": "@VERSION@",
+  "description": "Local network diagnostics",
+  "homepage": "https://github.com/Shroomate/wheredns-cli",
+  "license": "MIT",
+  "architecture": {
+    "64bit": {"url": "@VERIFIED_WINDOWS_ZIP_URL@", "hash": "@VERIFIED_SHA256@"}
+  },
+  "bin": "wheredns.exe"
+}
