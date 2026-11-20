@@ -3,7 +3,11 @@ name = "wheredns"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "Local network diagnostics"
+description = "DNS, email, web and network diagnostics from the terminal"
+repository = "https://github.com/Shroomate/wheredns-cli"
+readme = "README.md"
+keywords = ["dns", "email", "diagnostics", "network", "cli"]
+categories = ["command-line-utilities", "network-programming"]
 [dependencies]
 rand = "0.8"
 clap = { version = "4", features = ["derive", "env"] }

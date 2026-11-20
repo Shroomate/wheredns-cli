@@ -1,0 +1,68 @@
+name: Release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - { os: macos-15, target: aarch64-apple-darwin }
+          - { os: macos-15-intel, target: x86_64-apple-darwin }
+          - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check tag matches Cargo.toml
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          test "v$version" = "$GITHUB_REF_NAME"
+      - run: cargo build --locked --release
+      - name: Package
+        shell: bash
+        run: |
+          name="wheredns-$GITHUB_REF_NAME-${{ matrix.target }}"
+          mkdir "$name"
+          cp README.md LICENSE "$name/"
+          if [ "$RUNNER_OS" = Windows ]; then
+            cp target/release/wheredns.exe "$name/"
+            ./"$name"/wheredns.exe --version
+            7z a "$name.zip" "./$name/*" > /dev/null
+          else
+            cp target/release/wheredns "$name/"
+            ./"$name"/wheredns --version
+            tar -czf "$name.tar.gz" -C "$name" .
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: wheredns-*.*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums and package manifests
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          cd dist
+          sha256sum wheredns-* > SHA256SUMS
+          cd ..
+          packaging/render.sh "$version" dist/SHA256SUMS packaging/wheredns.rb.in > dist/wheredns.rb
+          packaging/render.sh "$version" dist/SHA256SUMS packaging/scoop.json.in > dist/wheredns.json
+          cat dist/SHA256SUMS
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --generate-notes

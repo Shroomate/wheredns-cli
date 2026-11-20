@@ -152,7 +152,7 @@ impl Group {
             g => g.id(),
         }
     }
-    /// Position in the website's panel order (1-based).
+    /// Panel order (1-based).
     pub fn n(self) -> usize {
         Group::ALL.iter().position(|g| *g == self).unwrap_or(0) + 1
     }

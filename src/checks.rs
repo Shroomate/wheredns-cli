@@ -1,5 +1,4 @@
-//! The eleven check groups, ported from the WhereDNS website's checks so the CLI
-//! reports the same evidence locally. Each returns JSON that one panel renders.
+//! The check groups. Each runs locally and returns JSON that one panel renders.
 
 use crate::{
     addresses, dns, lookup, public, publish, rdap, util, web, Args, CheckFailure, Group, Target,
@@ -20,7 +19,7 @@ fn need_domain<'a>(t: &'a Target, group: &str) -> Result<&'a str, CheckFailure> 
     Ok(&t.host)
 }
 
-/// Lookup outcome as the website names it: answered, nodata, nxdomain, or error.
+/// Lookup outcome as reported in JSON: answered, nodata, nxdomain, or error.
 fn kind_of(r: &Result<dns::Answer, String>) -> &'static str {
     match r {
         Ok(a) => a.kind(),

@@ -235,7 +235,7 @@ fn validate(m: &Message, q: &Message) -> Result<(), String> {
     Ok(())
 }
 impl Answer {
-    /// "answered", "nodata" or "nxdomain", as the website reports lookup outcomes.
+    /// "answered", "nodata" or "nxdomain", for JSON and panel tags.
     pub fn kind(&self) -> &'static str {
         if self.outcome == Outcome::NxDomain {
             "nxdomain"

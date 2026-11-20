@@ -51,4 +51,4 @@ for row in OUT:
  if row['case']=='Header initial empty separator' and json.loads(row['stdout'])['fields']: failures.append('body parsed as headers')
 if hits: failures.append('unrelated address used')
 assert not failures, failures
-print(f'{len(OUT)} offline review regressions passed')
+print(f'{len(OUT)} loopback regressions passed')

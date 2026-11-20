@@ -1,4 +1,4 @@
-//! Terminal report modeled on the WhereDNS website: framed, numbered panels with
+//! Terminal report in the layout of the WhereDNS web app: framed, numbered panels with
 //! per-check colors, status tags, hanging-indent wrapping, charts and bars.
 //! Remote text is escaped before display so evidence cannot drive the terminal.
 
@@ -66,7 +66,7 @@ impl Theme {
         }
     }
 
-    // Colors are the website's CSS tokens (web/public/style.css).
+    // Colors match the WhereDNS web app themes.
     fn palette(self) -> Palette {
         match self {
             Theme::Tty => Palette {
@@ -579,8 +579,8 @@ impl Renderer {
         }
     }
 
-    /// Writes one line. On a terminal the rest of the row is erased in the
-    /// theme background, so it reaches the right edge without trailing spaces.
+    /// Writes one line. On a terminal the row is filled to the right edge in the
+    /// theme background (or erased when there is no background).
     fn emit(&self, out: &mut String, line: &[Span]) {
         for s in line {
             self.paint(out, s.tone);
@@ -836,7 +836,7 @@ impl Renderer {
         out
     }
 
-    /// A sweeping comet across the panel, like the site's loading shimmer.
+    /// A sweeping comet across the panel, shown while a check runs.
     fn scanner(&self, gi: usize, frame: usize, w: usize) -> Line {
         let comet = 12usize;
         let span = w + comet;

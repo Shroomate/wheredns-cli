@@ -1,5 +1,5 @@
 //! RDAP registration evidence through rdap.org redirect routing, parsed into the
-//! same fields the website shows. Every hop is resolved and pinned by policy.
+//! fields shown in the whois panel. Every hop is resolved and pinned by policy.
 
 use crate::{addresses, Args};
 use serde_json::{json, Value};
