@@ -8,6 +8,9 @@ use std::{
     net::{IpAddr, SocketAddr},
     time::{Duration, Instant},
 };
+
+const SCHEMA_VERSION: u8 = 1;
+
 #[derive(Parser, Debug)]
 #[command(
     version,
@@ -15,9 +18,13 @@ use std::{
 )]
 struct Args {
     target: Option<String>,
-    #[arg(default_value = "summary")]
+    #[arg(default_value = "summary", value_parser = [
+        "summary", "where", "all", "dns", "email", "http", "web", "whois",
+        "rdap", "tcp", "ports", "ip", "prop", "propagation", "subdomains", "ping", "headers",
+    ])]
     check: String,
     /// DNS record types after the command, e.g. dns A MX
+    #[arg(value_parser = dns::parse_record_type)]
     records: Vec<String>,
     #[arg(long)]
     json: bool,
@@ -34,7 +41,8 @@ struct Args {
     #[arg(
         long = "type",
         value_delimiter = ',',
-        default_value = "A,AAAA,CNAME,NS,SOA,MX,TXT,CAA"
+        default_value = "A,AAAA,CNAME,NS,SOA,MX,TXT,CAA",
+        value_parser = dns::parse_record_type
     )]
     types: Vec<String>,
     #[arg(long, value_delimiter = ',', default_value = "443")]
@@ -53,6 +61,27 @@ struct Row {
     data: Value,
     error: Option<String>,
 }
+
+struct CheckFailure {
+    error: String,
+    data: Value,
+}
+
+impl From<String> for CheckFailure {
+    fn from(error: String) -> Self {
+        Self {
+            error,
+            data: Value::Null,
+        }
+    }
+}
+
+impl From<&str> for CheckFailure {
+    fn from(error: &str) -> Self {
+        error.to_string().into()
+    }
+}
+
 #[derive(Serialize)]
 struct Report {
     schema_version: u8,
@@ -109,7 +138,7 @@ fn target(raw: &str) -> Result<(String, reqwest::Url), String> {
     let u = reqwest::Url::parse(if raw.contains("://") {
         raw
     } else {
-        return target(&format!("https://{raw}/"));
+        return target(&format!("https://{raw}"));
     })
     .map_err(|e| e.to_string())?;
     if !["http", "https"].contains(&u.scheme())
@@ -158,8 +187,24 @@ async fn addresses(a: &Args, host: &str) -> Result<Vec<IpAddr>, String> {
     }
     Ok(ips)
 }
-async fn http(a: &Args, mut url: reqwest::Url, body: bool) -> Result<Value, String> {
+async fn http(a: &Args, url: reqwest::Url, body: bool) -> Result<Value, CheckFailure> {
     let mut hops = vec![];
+    match http_hops(a, url, body, &mut hops).await {
+        Ok(data) => Ok(json!({"hops":hops,"body":data,"http_success":true})),
+        Err(error) if hops.is_empty() => Err(error.into()),
+        Err(error) => Err(CheckFailure {
+            error,
+            data: json!({"hops":hops,"body":null,"http_success":false}),
+        }),
+    }
+}
+
+async fn http_hops(
+    a: &Args,
+    mut url: reqwest::Url,
+    body: bool,
+    hops: &mut Vec<Value>,
+) -> Result<Value, String> {
     for _ in 0..6 {
         let host = url
             .host_str()
@@ -212,7 +257,10 @@ async fn http(a: &Args, mut url: reqwest::Url, body: bool) -> Result<Value, Stri
             url = next;
             continue;
         }
-        let data = if body {
+        if !status.is_success() {
+            return Err(format!("HTTP status {status}"));
+        }
+        return if body {
             let mut bytes = vec![];
             let mut chunks = response.bytes_stream();
             while let Some(chunk) = chunks.next().await {
@@ -222,14 +270,10 @@ async fn http(a: &Args, mut url: reqwest::Url, body: bool) -> Result<Value, Stri
                 }
                 bytes.extend_from_slice(&c)
             }
-            serde_json::from_slice::<Value>(&bytes).map_err(|e| e.to_string())?
+            serde_json::from_slice::<Value>(&bytes).map_err(|e| e.to_string())
         } else {
-            Value::Null
+            Ok(Value::Null)
         };
-        if !status.is_success() {
-            return Err(format!("HTTP status {status}"));
-        }
-        return Ok(json!({"hops":hops,"body":data,"http_success":true}));
     }
     Err("redirect limit exceeded".into())
 }
@@ -283,15 +327,17 @@ fn parse_headers(raw: &str) -> Value {
             malformed += 1
         }
     }
-    json!({"fields":fields,"malformed_lines":malformed,"authentication_results_untrusted":true})
+    json!({"schema_version":SCHEMA_VERSION,"fields":fields,"malformed_lines":malformed,"authentication_results_untrusted":true})
 }
-async fn check(a: &Args, host: &str, url: &reqwest::Url, kind: &str) -> Result<Value, String> {
+async fn check(
+    a: &Args,
+    host: &str,
+    url: &reqwest::Url,
+    kind: &str,
+) -> Result<Value, CheckFailure> {
     match kind {
         "dns" => {
-            let tasks = a.types.iter().map(|t| async move {
-                let t = t.to_uppercase();
-                lookup(a, host, &t, a.resolver, true).await
-            });
+            let tasks = a.types.iter().map(|t| lookup(a, host, t, a.resolver, true));
             let rows: Vec<_> = stream::iter(tasks)
                 .buffered(a.concurrency as usize)
                 .collect::<Vec<_>>()
@@ -330,8 +376,7 @@ async fn check(a: &Args, host: &str, url: &reqwest::Url, kind: &str) -> Result<V
                 json!({"queries":rows,"scope":"DNS policy evidence; no delivery or signature validation"}),
             )
         }
-        "http" => http(a, url.clone(), false).await,
-        "web" => http(a, url.clone(), false).await,
+        "http" | "web" => http(a, url.clone(), false).await,
         "whois" | "rdap" => {
             let path = if host.parse::<IpAddr>().is_ok() {
                 "ip"
@@ -362,44 +407,33 @@ async fn check(a: &Args, host: &str, url: &reqwest::Url, kind: &str) -> Result<V
             Ok(json!({"addresses":rows}))
         }
         "prop" | "propagation" => {
-            let mut zone = host.to_string();
+            let mut zone = host.trim_end_matches('.');
             let ns = loop {
-                let r = lookup(a, &zone, "NS", a.resolver, true).await?;
-                if r.outcome != dns::Outcome::NoError {
-                    return Err("no authoritative zone evidence".into());
+                let r = lookup(a, zone, "NS", a.resolver, true).await?;
+                if r.outcome == dns::Outcome::NoError {
+                    let ns: Vec<_> = r
+                        .records
+                        .into_iter()
+                        .filter(|r| {
+                            r.rr_class == 1
+                                && r.rr_type == "NS"
+                                && r.name.trim_end_matches('.').eq_ignore_ascii_case(zone)
+                        })
+                        .map(|r| r.value)
+                        .collect();
+                    if !ns.is_empty() {
+                        break ns;
+                    }
                 }
-                let ns: Vec<_> = r
-                    .records
-                    .into_iter()
-                    .filter(|r| {
-                        r.rr_class == 1
-                            && r.rr_type == "NS"
-                            && r.name
-                                .trim_end_matches('.')
-                                .eq_ignore_ascii_case(zone.trim_end_matches('.'))
-                    })
-                    .map(|r| r.value)
-                    .collect();
-                if !ns.is_empty() {
-                    break ns;
-                }
-                zone = zone
-                    .split_once('.')
-                    .ok_or("no authoritative zone found")?
-                    .1
-                    .to_string();
+                zone = zone.split_once('.').ok_or("no authoritative zone found")?.1;
             };
             let mut rows = vec![];
             for name in ns.iter().take(6) {
-                match addresses(a, name).await {
-                    Ok(ips) => {
-                        let server = SocketAddr::new(ips[0], 53);
-                        let answer = lookup(a, host, "A", server, false).await?;
-                        let soa = lookup(a, &zone, "SOA", server, false).await?;
-                        rows.push(json!({"server":name,"answer":answer,"soa":soa}));
-                    }
-                    Err(e) => return Err(e),
-                }
+                let ips = addresses(a, name).await?;
+                let server = SocketAddr::new(ips[0], 53);
+                let answer = lookup(a, host, "A", server, false).await?;
+                let soa = lookup(a, zone, "SOA", server, false).await?;
+                rows.push(json!({"server":name,"answer":answer,"soa":soa}));
             }
             Ok(
                 json!({"zone":zone,"servers":rows,"scope":"up to six authoritative servers; A answers and SOA evidence"}),
@@ -468,13 +502,14 @@ async fn check(a: &Args, host: &str, url: &reqwest::Url, kind: &str) -> Result<V
                     "ping failed: {}{}",
                     String::from_utf8_lossy(&out.stdout[..out.stdout.len().min(65536)]),
                     String::from_utf8_lossy(&out.stderr[..out.stderr.len().min(65536)])
-                ));
+                )
+                .into());
             }
             Ok(
                 json!({"success":true,"raw":String::from_utf8_lossy(&out.stdout[..out.stdout.len().min(65536)])}),
             )
         }
-        _ => Err(format!("unknown check: {kind}")),
+        _ => Err(format!("unknown check: {kind}").into()),
     }
 }
 #[tokio::main]
@@ -549,11 +584,11 @@ async fn main() {
                     data,
                     error: None,
                 },
-                Err(e) => Row {
+                Err(failure) => Row {
                     check: kind.into(),
                     ok: false,
-                    data: Value::Null,
-                    error: Some(e),
+                    data: failure.data,
+                    error: Some(failure.error),
                 },
             })
         }
@@ -562,7 +597,7 @@ async fn main() {
     let (rows, complete) = tokio::select! {r=work=>(r,true),_=tokio::signal::ctrl_c()=>(vec![Row{check:"run".into(),ok:false,data:Value::Null,error:Some("cancelled".into())}],false),_=tokio::time::sleep(Duration::from_secs(a.deadline))=>(vec![Row{check:"run".into(),ok:false,data:Value::Null,error:Some("aggregate deadline exceeded".into())}],false)};
     let ok = complete && rows.iter().all(|r| r.ok);
     let report = Report {
-        schema_version: 1,
+        schema_version: SCHEMA_VERSION,
         target: host,
         vantage: "local",
         elapsed_ms: start.elapsed().as_millis(),
@@ -578,14 +613,17 @@ async fn main() {
                 .results
                 .iter()
                 .map(|r| {
-                    format!(
-                        "{}: {}\n{}",
-                        r.check,
-                        if r.ok { "completed" } else { "failed" },
-                        r.error
-                            .clone()
-                            .unwrap_or_else(|| serde_json::to_string_pretty(&r.data).unwrap())
-                    )
+                    let status = if r.ok { "completed" } else { "failed" };
+                    let mut output = format!("{}: {status}", r.check);
+                    if let Some(error) = &r.error {
+                        output.push('\n');
+                        output.push_str(error);
+                    }
+                    if r.ok || !r.data.is_null() {
+                        output.push('\n');
+                        output.push_str(&serde_json::to_string_pretty(&r.data).unwrap());
+                    }
+                    output
                 })
                 .collect::<Vec<_>>()
                 .join("\n")
@@ -637,6 +675,10 @@ mod tests {
         );
         assert!(target("https://user:pass@example.com").is_err());
         assert!(target("file:///etc/passwd").is_err());
+        assert_eq!(
+            target("example.com/path?q=1").unwrap().1.as_str(),
+            "https://example.com/path?q=1"
+        );
     }
     #[test]
     fn header_fixture() {

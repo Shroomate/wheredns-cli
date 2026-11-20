@@ -8,7 +8,8 @@ network diagnostics.
 Build WhereDNS from source with a current stable Rust toolchain and Apple's
 command-line developer tools. If you already have Xcode or its command-line
 tools, skip `xcode-select --install`. If you already have Cargo, skip the Rust
-installation step.
+installation step. Rust is needed to build WhereDNS. The installed executable
+runs without a Rust toolchain.
 
 1. Install [Apple's Command Line Tools](https://developer.apple.com/documentation/xcode/installing-the-command-line-tools/).
 

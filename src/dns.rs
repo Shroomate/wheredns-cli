@@ -1,6 +1,6 @@
 use hickory_proto::{
-    op::{Message, Query},
-    rr::{Name, RecordType},
+    op::{Message, Query, ResponseCode},
+    rr::{Name, RData, RecordType},
 };
 use serde::Serialize;
 use std::{
@@ -11,6 +11,14 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpStream, UdpSocket},
 };
+
+const MAX_CNAME_LINKS: usize = 8;
+
+pub fn parse_record_type(kind: &str) -> Result<String, String> {
+    let kind = kind.to_ascii_uppercase();
+    RecordType::from_str(&kind).map_err(|e| e.to_string())?;
+    Ok(kind)
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Record {
@@ -83,7 +91,7 @@ pub async fn query(
     }
     if !matches!(
         m.response_code(),
-        hickory_proto::op::ResponseCode::NoError | hickory_proto::op::ResponseCode::NXDomain
+        ResponseCode::NoError | ResponseCode::NXDomain
     ) {
         return Err(format!("DNS resolver failure: {}", m.response_code()));
     }
@@ -91,14 +99,8 @@ pub async fn query(
         name: name.into(),
         rr_type: kind.into(),
         server: server.to_string(),
-        status: if m.response_code() == hickory_proto::op::ResponseCode::NoError
-            && m.answers().is_empty()
-        {
-            "NODATA".into()
-        } else {
-            m.response_code().to_string()
-        },
-        outcome: if m.response_code() == hickory_proto::op::ResponseCode::NoError {
+        status: response_status(&m, &q.queries()[0]),
+        outcome: if m.response_code() == ResponseCode::NoError {
             Outcome::NoError
         } else {
             Outcome::NxDomain
@@ -117,6 +119,51 @@ pub async fn query(
             .collect(),
     })
 }
+
+fn response_status(message: &Message, question: &Query) -> String {
+    let code = message.response_code();
+    if code != ResponseCode::NoError {
+        return code.to_string();
+    }
+    let mut owner = question.name();
+    for _ in 0..=MAX_CNAME_LINKS {
+        let records = message
+            .answers()
+            .iter()
+            .filter(|r| r.name() == owner && r.dns_class() == question.query_class());
+        if records.clone().any(|r| {
+            r.data().is_some()
+                && (r.record_type() == question.query_type()
+                    || question.query_type() == RecordType::ANY)
+        }) {
+            return code.to_string();
+        }
+        let mut aliases = records.filter_map(|r| match r.data() {
+            Some(RData::CNAME(target)) => Some(&target.0),
+            _ => None,
+        });
+        match (aliases.next(), aliases.next()) {
+            (Some(target), None) => owner = target,
+            (None, _) => {
+                let mut authority = message
+                    .name_servers()
+                    .iter()
+                    .filter(|r| r.dns_class() == question.query_class());
+                // An NS-only authority section is a referral (RFC 2308, §2.2).
+                return if authority.clone().any(|r| r.record_type() == RecordType::NS)
+                    && !authority.any(|r| r.record_type() == RecordType::SOA)
+                {
+                    "REFERRAL".into()
+                } else {
+                    "NODATA".into()
+                };
+            }
+            _ => break,
+        }
+    }
+    code.to_string()
+}
+
 fn validate(m: &Message, q: &Message) -> Result<(), String> {
     if m.id() != q.id()
         || m.queries() != q.queries()
@@ -135,7 +182,7 @@ impl Answer {
         let canonical = |s: &str| s.trim_end_matches('.').to_ascii_lowercase();
         let mut owner = canonical(&self.name);
         let mut seen = std::collections::HashSet::new();
-        for _ in 0..=8 {
+        for _ in 0..=MAX_CNAME_LINKS {
             if !seen.insert(owner.clone()) {
                 return Err("CNAME loop".into());
             }
