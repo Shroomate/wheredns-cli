@@ -1,68 +1,232 @@
+mod checks;
+mod config;
+mod display;
 mod dns;
+mod headers;
+mod rdap;
+mod util;
+mod web;
+
 use clap::Parser;
-use futures_util::{stream, StreamExt};
+use futures_util::{stream::FuturesUnordered, StreamExt};
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::{
-    io::{self, Read},
+    collections::HashMap,
+    io::{self, IsTerminal, Write},
     net::{IpAddr, SocketAddr},
+    sync::{Mutex, OnceLock},
     time::{Duration, Instant},
 };
+
+pub const SCHEMA_VERSION: u8 = 2;
+
+const AFTER_HELP: &str = "\
+Checks (combine any; default for a domain is: where email ping whois web):
+  where        DNS hosting service, domain registrar, IP network owner
+  email        MX, SPF, DMARC, DKIM, MTA-STS, TLS-RPT, BIMI
+  ping         10 ICMP echoes with a latency chart
+  whois        RDAP registration: registrar, dates, status, nameservers
+  web          status, redirects, DNS/TCP/TLS/response timing, certificate, HSTS
+  dns [TYPES]  records, e.g. `dns A MX TXT`; default is 14 types + SRV/TLSA presets
+  blacklist    the IP (or the domain's mail servers) on 14 DNS blocklists
+  ip           reverse DNS + forward confirmation, ASN, BGP prefix, network owner
+  ports [N..]  common TCP ports, or up to 10 given, e.g. `ports 22 8080`
+  propagation  ask each authoritative nameserver directly and compare
+  subdomains   20 common names with randomized wildcard controls
+  dkim:SEL     email check using this DKIM selector, e.g. dkim:google
+  all          every check
+
+Examples:
+  wheredns github.com
+  wheredns google.com email dkim:20230601
+  wheredns example.com dns A MX propagation
+  wheredns 8.8.8.8 blacklist ip
+  wheredns cloudflare.com web ports ping
+  pbpaste | wheredns headers
+
+Themes: btop (default), tty, purple, phosphor, amber.
+
+Settings (saved in ~/.config/wheredns/config):
+  wheredns config                          show settings and the file path
+  wheredns config set theme tty            keep a theme
+  wheredns config set checks where web dns default checks for a domain
+  wheredns config set animate minimal      full (live panels), minimal or off
+  wheredns config set background false     use the terminal's own background
+Flags beat WHEREDNS_THEME / WHEREDNS_ANIMATE, which beat the config file.
+Exit codes: 0 checks completed, 1 a check failed, 2 invalid input, 130 cancelled or deadline.";
+
 #[derive(Parser, Debug)]
 #[command(
     version,
-    about = "Local DNS, mail, registration and network diagnostics"
+    about = "DNS, email, registration and network diagnostics from your own machine",
+    after_help = AFTER_HELP
 )]
-struct Args {
+pub struct Args {
+    /// Domain, IP address or URL; or `headers` to analyze an email header from stdin
     target: Option<String>,
-    #[arg(default_value = "summary")]
-    check: String,
-    /// DNS record types after the command, e.g. dns A MX
-    records: Vec<String>,
+    /// Checks to run, with their arguments (see below)
+    checks: Vec<String>,
+    /// Machine-readable JSON (no colors)
     #[arg(long)]
-    json: bool,
+    pub json: bool,
+    /// Color theme for the terminal report [default: btop, or the saved theme]
+    #[arg(long, value_enum, env = "WHEREDNS_THEME")]
+    pub theme: Option<display::Theme>,
+    /// Live animation on a terminal [default: full, or the saved setting]
+    #[arg(long, value_enum, env = "WHEREDNS_ANIMATE")]
+    pub animate: Option<display::Animate>,
+    /// Allow private, loopback and other non-public destinations and resolvers
     #[arg(long)]
-    allow_private: bool,
+    pub allow_private: bool,
+    /// Per-operation timeout in seconds
     #[arg(long,default_value_t=5,value_parser=clap::value_parser!(u64).range(1..=30))]
-    timeout: u64,
+    pub timeout: u64,
+    /// Whole-run deadline in seconds
     #[arg(long,default_value_t=60,value_parser=clap::value_parser!(u64).range(1..=300))]
-    deadline: u64,
+    pub deadline: u64,
+    /// Parallel DNS/TCP operations per check
     #[arg(long,default_value_t=4,value_parser=clap::value_parser!(u8).range(1..=16))]
-    concurrency: u8,
+    pub concurrency: u8,
+    /// Recursive DNS resolver (IP:port)
     #[arg(long, default_value = "1.1.1.1:53")]
-    resolver: SocketAddr,
-    #[arg(
-        long = "type",
-        value_delimiter = ',',
-        default_value = "A,AAAA,CNAME,NS,SOA,MX,TXT,CAA"
-    )]
-    types: Vec<String>,
-    #[arg(long, value_delimiter = ',', default_value = "443")]
-    ports: Vec<u16>,
-    #[arg(
-        long,
-        value_delimiter = ',',
-        default_value = "default,google,selector1,selector2"
-    )]
-    selectors: Vec<String>,
+    pub resolver: SocketAddr,
+    /// DNS record types for the dns check (same as `dns A MX`)
+    #[arg(long = "type", value_delimiter = ',', value_parser = dns::parse_record_type)]
+    pub types: Vec<String>,
+    /// TCP ports for the ports check (same as `ports 22 443`)
+    #[arg(long, value_delimiter = ',')]
+    pub ports: Vec<u16>,
+    /// DKIM selectors for the email check (same as `dkim:google`)
+    #[arg(long, value_delimiter = ',')]
+    pub selectors: Vec<String>,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Group {
+    Where,
+    Email,
+    Ping,
+    Whois,
+    Web,
+    Dns,
+    Blacklist,
+    Ip,
+    Ports,
+    Propagation,
+    Subdomains,
+}
+
+impl Group {
+    pub const ALL: [Group; 11] = [
+        Group::Where,
+        Group::Email,
+        Group::Ping,
+        Group::Whois,
+        Group::Web,
+        Group::Dns,
+        Group::Blacklist,
+        Group::Ip,
+        Group::Ports,
+        Group::Propagation,
+        Group::Subdomains,
+    ];
+    pub fn id(self) -> &'static str {
+        match self {
+            Group::Where => "where",
+            Group::Email => "email",
+            Group::Ping => "ping",
+            Group::Whois => "whois",
+            Group::Web => "web",
+            Group::Dns => "dns",
+            Group::Blacklist => "blacklist",
+            Group::Ip => "ip",
+            Group::Ports => "ports",
+            Group::Propagation => "propagation",
+            Group::Subdomains => "subdomains",
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Group::Ip => "ip+asn",
+            g => g.id(),
+        }
+    }
+    /// Panel order (1-based).
+    pub fn n(self) -> usize {
+        Group::ALL.iter().position(|g| *g == self).unwrap_or(0) + 1
+    }
+    fn domain_only(self) -> bool {
+        matches!(
+            self,
+            Group::Where | Group::Email | Group::Dns | Group::Propagation | Group::Subdomains
+        )
+    }
+    pub fn from_id(id: &str) -> Option<Group> {
+        Some(match id {
+            "where" | "summary" | "wheredns" => Group::Where,
+            "email" | "mail" => Group::Email,
+            "ping" | "icmp" => Group::Ping,
+            "whois" | "rdap" => Group::Whois,
+            "web" | "http" | "https" => Group::Web,
+            "dns" => Group::Dns,
+            "blacklist" | "bl" | "dnsbl" => Group::Blacklist,
+            "ip" | "asn" => Group::Ip,
+            "ports" | "tcp" => Group::Ports,
+            "propagation" | "prop" => Group::Propagation,
+            "subdomains" | "subs" => Group::Subdomains,
+            _ => return None,
+        })
+    }
+}
+
 #[derive(Serialize)]
-struct Row {
-    check: String,
-    ok: bool,
-    data: Value,
-    error: Option<String>,
+pub struct Row {
+    pub check: String,
+    pub ok: bool,
+    pub elapsed_ms: u128,
+    pub data: Value,
+    pub error: Option<String>,
 }
+
+pub struct CheckFailure {
+    pub error: String,
+    pub data: Value,
+}
+
+impl From<String> for CheckFailure {
+    fn from(error: String) -> Self {
+        Self {
+            error,
+            data: Value::Null,
+        }
+    }
+}
+
+impl From<&str> for CheckFailure {
+    fn from(error: &str) -> Self {
+        error.to_string().into()
+    }
+}
+
 #[derive(Serialize)]
-struct Report {
-    schema_version: u8,
-    target: String,
-    vantage: &'static str,
-    elapsed_ms: u128,
-    complete: bool,
-    results: Vec<Row>,
+pub struct Report {
+    pub schema_version: u8,
+    pub target: String,
+    pub vantage: &'static str,
+    pub elapsed_ms: u128,
+    pub complete: bool,
+    pub results: Vec<Row>,
 }
-fn public(ip: IpAddr) -> bool {
+
+pub struct Target {
+    pub host: String,
+    pub url: reqwest::Url,
+    pub ip: Option<IpAddr>,
+    pub explicit_http: bool,
+}
+
+pub fn public(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(a) => {
             let o = a.octets();
@@ -95,13 +259,15 @@ fn public(ip: IpAddr) -> bool {
         }
     }
 }
-fn permit(ip: IpAddr, a: &Args) -> Result<(), String> {
+
+pub fn permit(ip: IpAddr, a: &Args) -> Result<(), String> {
     if a.allow_private || public(ip) {
         Ok(())
     } else {
         Err(format!("destination {ip} requires --allow-private"))
     }
 }
+
 fn target(raw: &str) -> Result<(String, reqwest::Url), String> {
     if raw.parse::<IpAddr>().is_ok_and(|v| v.is_ipv6()) {
         return target(&format!("https://[{raw}]/"));
@@ -109,23 +275,47 @@ fn target(raw: &str) -> Result<(String, reqwest::Url), String> {
     let u = reqwest::Url::parse(if raw.contains("://") {
         raw
     } else {
-        return target(&format!("https://{raw}/"));
+        return target(&format!("https://{raw}"));
     })
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| format!("invalid target {raw:?}: {e}"))?;
     if !["http", "https"].contains(&u.scheme())
         || !u.username().is_empty()
         || u.password().is_some()
     {
-        return Err("expected HTTP(S) URL without credentials".into());
+        return Err("expected a domain, IP address or HTTP(S) URL without credentials".into());
     }
     let host = u
         .host_str()
         .ok_or("missing hostname")?
         .trim_matches(['[', ']'])
+        .trim_end_matches('.')
         .to_string();
     Ok((host, u))
 }
-async fn lookup(
+
+fn partials() -> &'static Mutex<HashMap<&'static str, Value>> {
+    static PARTIAL: OnceLock<Mutex<HashMap<&'static str, Value>>> = OnceLock::new();
+    PARTIAL.get_or_init(Default::default)
+}
+
+/// Streams a running check's evidence so far to the live view.
+pub fn publish(g: Group, v: Value) {
+    partials().lock().unwrap().insert(g.id(), v);
+}
+
+fn partial(g: Group) -> Option<Value> {
+    partials().lock().unwrap().get(g.id()).cloned()
+}
+
+type CacheKey = (String, String, SocketAddr, bool);
+
+fn cache() -> &'static Mutex<HashMap<CacheKey, Result<dns::Answer, String>>> {
+    static CACHE: OnceLock<Mutex<HashMap<CacheKey, Result<dns::Answer, String>>>> = OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// One DNS question, memoized for the run so checks share evidence.
+pub async fn lookup(
     a: &Args,
     name: &str,
     kind: &str,
@@ -133,484 +323,476 @@ async fn lookup(
     recursive: bool,
 ) -> Result<dns::Answer, String> {
     permit(server.ip(), a)?;
-    tokio::time::timeout(
+    let key = (
+        name.to_ascii_lowercase(),
+        kind.to_string(),
+        server,
+        recursive,
+    );
+    if let Some(hit) = cache().lock().unwrap().get(&key) {
+        return hit.clone();
+    }
+    let result = tokio::time::timeout(
         Duration::from_secs(a.timeout),
         dns::query(name, kind, server, recursive),
     )
     .await
-    .map_err(|_| "DNS timeout".to_string())?
+    .map_err(|_| "DNS timeout".to_string())
+    .and_then(|r| r);
+    cache().lock().unwrap().insert(key, result.clone());
+    result
 }
-async fn addresses(a: &Args, host: &str) -> Result<Vec<IpAddr>, String> {
+
+pub async fn addresses(a: &Args, host: &str) -> Result<Vec<IpAddr>, String> {
     let mut ips = vec![];
     if let Ok(ip) = host.parse() {
         ips.push(ip)
     } else {
-        for ty in ["A", "AAAA"] {
-            let r = lookup(a, host, ty, a.resolver, true).await?;
-            ips.extend(r.addresses()?);
+        let (v4, v6) = tokio::join!(
+            lookup(a, host, "A", a.resolver, true),
+            lookup(a, host, "AAAA", a.resolver, true)
+        );
+        let (v4, v6) = (v4?, v6?);
+        if v4.outcome == dns::Outcome::NxDomain && v6.outcome == dns::Outcome::NxDomain {
+            return Err(format!("{host} does not exist (NXDOMAIN)"));
         }
+        ips.extend(v4.addresses()?);
+        ips.extend(v6.addresses()?);
     }
     if ips.is_empty() {
-        return Err("no IP addresses".into());
+        return Err(format!("{host} has no A or AAAA record"));
     }
     for ip in &ips {
         permit(*ip, a)?
     }
     Ok(ips)
 }
-async fn http(a: &Args, mut url: reqwest::Url, body: bool) -> Result<Value, String> {
-    let mut hops = vec![];
-    for _ in 0..6 {
-        let host = url
-            .host_str()
-            .ok_or("missing host")?
-            .trim_matches(['[', ']'])
-            .to_string();
-        let ips = addresses(a, &host).await?;
-        let port = url.port_or_known_default().ok_or("unknown port")?;
-        let sockets: Vec<_> = ips
-            .into_iter()
-            .map(|ip| SocketAddr::new(ip, port))
-            .collect();
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(a.timeout))
-            .resolve_to_addrs(&host, &sockets)
-            .build()
-            .map_err(|e| e.to_string())?;
-        let start = Instant::now();
-        let response = if body {
-            client.get(url.clone())
-        } else {
-            client.head(url.clone())
-        }
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-        let status = response.status();
-        let headers: Vec<_> = response
-            .headers()
-            .iter()
-            .map(|(k, v)| json!({"name":k.as_str(),"value":v.to_str().unwrap_or("<binary>")}))
-            .collect();
-        hops.push(json!({"url":url.as_str(),"status":status.as_u16(),"headers":headers,"elapsed_ms":start.elapsed().as_millis()}));
-        if status.is_redirection() {
-            let loc = response
-                .headers()
-                .get("location")
-                .ok_or("redirect without location")?
-                .to_str()
-                .map_err(|e| e.to_string())?;
-            let next = url.join(loc).map_err(|e| e.to_string())?;
-            if !["http", "https"].contains(&next.scheme())
-                || !next.username().is_empty()
-                || next.password().is_some()
+
+async fn run_group(a: &Args, t: &Target, g: Group) -> Row {
+    let start = Instant::now();
+    let result = match g {
+        Group::Where => checks::where_(a, t).await,
+        Group::Email => checks::email(a, t).await,
+        Group::Ping => checks::ping(a, t).await,
+        Group::Whois => checks::whois(a, t).await,
+        Group::Web => checks::web(a, t).await,
+        Group::Dns => checks::dns(a, t).await,
+        Group::Blacklist => checks::blacklist(a, t).await,
+        Group::Ip => checks::ip(a, t).await,
+        Group::Ports => checks::ports(a, t).await,
+        Group::Propagation => checks::propagation(a, t).await,
+        Group::Subdomains => checks::subdomains(a, t).await,
+    };
+    let elapsed_ms = start.elapsed().as_millis();
+    match result {
+        Ok(data) => Row {
+            check: g.id().into(),
+            ok: true,
+            elapsed_ms,
+            data,
+            error: None,
+        },
+        Err(f) => Row {
+            check: g.id().into(),
+            ok: false,
+            elapsed_ms,
+            data: f.data,
+            error: Some(f.error),
+        },
+    }
+}
+
+fn usage(message: impl std::fmt::Display) -> ! {
+    eprintln!("wheredns: {message}\nRun `wheredns --help` for checks and examples.");
+    std::process::exit(2)
+}
+
+/// Turns `dns A MX ports 22 dkim:google all` into groups and their arguments.
+fn plan(a: &mut Args, is_ip: bool, saved: Option<&[String]>) -> Vec<Group> {
+    let mut groups: Vec<Group> = vec![];
+    let mut after_dns = false;
+    let mut numbers = vec![];
+    let mut all = false;
+    for token in a.checks.clone() {
+        let flag = token.trim_start_matches('-').to_ascii_lowercase();
+        if let Some(sel) = flag.strip_prefix("dkim:") {
+            if sel.is_empty()
+                || sel.len() > 63
+                || !sel
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b"_-.".contains(&c))
             {
-                return Err("unsafe redirect".into());
+                usage(format!("invalid DKIM selector in {token:?}"));
             }
-            url = next;
+            a.selectors.push(sel.to_string());
+            groups.push(Group::Email);
             continue;
         }
-        let data = if body {
-            let mut bytes = vec![];
-            let mut chunks = response.bytes_stream();
-            while let Some(chunk) = chunks.next().await {
-                let c = chunk.map_err(|e| e.to_string())?;
-                if bytes.len() + c.len() > 1048576 {
-                    return Err("HTTP body exceeds 1 MiB".into());
-                }
-                bytes.extend_from_slice(&c)
+        if flag.bytes().all(|c| c.is_ascii_digit()) && !flag.is_empty() {
+            match flag.parse::<u16>() {
+                Ok(p) if p > 0 => numbers.push(p),
+                _ => usage(format!("invalid port {token:?}")),
             }
-            serde_json::from_slice::<Value>(&bytes).map_err(|e| e.to_string())?
-        } else {
-            Value::Null
-        };
-        if !status.is_success() {
-            return Err(format!("HTTP status {status}"));
+            continue;
         }
-        return Ok(json!({"hops":hops,"body":data,"http_success":true}));
+        if flag == "all" {
+            all = true;
+            continue;
+        }
+        // After `dns`, record types win over check names (e.g. `dns HTTPS`).
+        if after_dns {
+            if let Ok(ty) = dns::parse_record_type(&flag) {
+                if !a.types.contains(&ty) {
+                    a.types.push(ty);
+                }
+                continue;
+            }
+        }
+        if let Some(g) = Group::from_id(&flag) {
+            after_dns = g == Group::Dns;
+            groups.push(g);
+            continue;
+        }
+        usage(format!("unknown check or argument {token:?}"));
     }
-    Err("redirect limit exceeded".into())
-}
-fn ping_program(os: &str, ip: IpAddr) -> &'static str {
-    if os == "macos" && ip.is_ipv6() {
-        "ping6"
-    } else {
-        "ping"
+    if !numbers.is_empty() {
+        if !groups.contains(&Group::Ports) && !all {
+            usage("port numbers need the `ports` check, e.g. `ports 22 8080`");
+        }
+        for p in numbers {
+            if !a.ports.contains(&p) {
+                a.ports.push(p);
+            }
+        }
     }
-}
-fn read_headers(reader: impl Read) -> Result<String, String> {
-    let mut bytes = Vec::new();
-    reader
-        .take(65537)
-        .read_to_end(&mut bytes)
-        .map_err(|e| format!("header input: {e}"))?;
-    if bytes.len() > 65536 {
-        return Err("headers exceed 64 KiB".into());
+    if a.ports.len() > 10 || a.types.len() > 20 || a.selectors.len() > 10 {
+        usage("at most 10 ports, 20 record types and 10 DKIM selectors");
     }
-    String::from_utf8(bytes).map_err(|_| "headers require UTF-8".into())
+    if all {
+        groups = Group::ALL.to_vec();
+    } else if groups.is_empty() {
+        let saved: Vec<Group> = saved
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|c| Group::from_id(c))
+            .filter(|g| !(is_ip && g.domain_only()))
+            .collect();
+        groups = if !saved.is_empty() {
+            saved
+        } else if is_ip {
+            vec![Group::Ping, Group::Whois, Group::Web, Group::Ip]
+        } else {
+            vec![
+                Group::Where,
+                Group::Email,
+                Group::Ping,
+                Group::Whois,
+                Group::Web,
+            ]
+        };
+    }
+    if is_ip {
+        if !all {
+            if let Some(g) = groups.iter().find(|g| g.domain_only()) {
+                usage(format!("{} needs a domain, not an IP address", g.id()));
+            }
+        }
+        groups.retain(|g| !g.domain_only());
+    }
+    let mut ordered: Vec<Group> = Group::ALL
+        .iter()
+        .copied()
+        .filter(|g| groups.contains(g))
+        .collect();
+    ordered.dedup();
+    ordered
 }
-fn parse_headers(raw: &str) -> Value {
-    let mut unfolded = String::new();
-    for line in raw.lines() {
-        if line.is_empty() {
+
+/// Bookkeeping for the live view: what is committed above, how tall the
+/// redrawn region below is, and when each panel started its entrance.
+struct LiveView {
+    printed: usize,
+    height: usize,
+    reveal_at: Vec<Option<Instant>>,
+}
+
+/// Redraws the live region in place. Finished panels are committed above it
+/// in order (after a short entrance); `last` commits everything that is done.
+fn draw(
+    r: &display::Renderer,
+    groups: &[Group],
+    slots: &[Option<Row>],
+    v: &mut LiveView,
+    frame: usize,
+    started: &[Instant],
+    last: bool,
+) -> String {
+    let max_lines = display::term_rows().saturating_sub(1).max(8);
+    let mut s = String::from("\x1b[?2026h");
+    let mut up = v.height;
+    if let Some(old) = r.refresh_width() {
+        // Terminals rewrap the old rows when the window narrows.
+        let cols = r.width() + 1;
+        if old + 1 > cols {
+            up = v.height * (old + 1).div_ceil(cols);
+        }
+    }
+    if up > 0 {
+        s.push_str(&format!("\x1b[{up}F"));
+    }
+    let now = Instant::now();
+    while v.printed < groups.len() {
+        let i = v.printed;
+        let Some(row) = &slots[i] else { break };
+        let panel = r.panel(row, Some(groups[i]));
+        let tall = panel.matches('\n').count() + 2 > max_lines;
+        let queue = slots[i..].iter().take_while(|s| s.is_some()).count();
+        let at = *v.reveal_at[i].get_or_insert(now);
+        let lines = panel.matches('\n').count() as u64;
+        let dur = (200 + lines * 8).min(450) / queue.clamp(1, 3) as u64;
+        let p = now.duration_since(at).as_millis() as f64 / dur as f64;
+        if last || tall || p >= 1.0 {
+            s.push_str(&panel);
+            v.printed += 1;
+        } else {
             break;
         }
-        if line.starts_with([' ', '\t']) && !unfolded.is_empty() {
-            unfolded.push(' ');
-            unfolded.push_str(line.trim());
-        } else {
-            if !unfolded.is_empty() {
-                unfolded.push('\n');
-            }
-            unfolded.push_str(line);
-        }
     }
-    let mut fields = vec![];
-    let mut malformed = 0;
-    for line in unfolded.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Some((n, v)) = line.split_once(':') {
-            if !n.is_empty() && n.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-') {
-                fields.push(json!({"name":n.to_ascii_lowercase(),"value":v.trim()}));
-            } else {
-                malformed += 1
-            }
-        } else {
-            malformed += 1
-        }
-    }
-    json!({"fields":fields,"malformed_lines":malformed,"authentication_results_untrusted":true})
-}
-async fn check(a: &Args, host: &str, url: &reqwest::Url, kind: &str) -> Result<Value, String> {
-    match kind {
-        "dns" => {
-            let tasks = a.types.iter().map(|t| async move {
-                let t = t.to_uppercase();
-                lookup(a, host, &t, a.resolver, true).await
-            });
-            let rows: Vec<_> = stream::iter(tasks)
-                .buffered(a.concurrency as usize)
-                .collect::<Vec<_>>()
-                .await
-                .into_iter()
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(json!({"queries":rows}))
-        }
-        "email" => {
-            let mut names = vec![
-                (host.to_string(), "MX"),
-                (host.to_string(), "TXT"),
-                (format!("_dmarc.{host}"), "TXT"),
-                (format!("_mta-sts.{host}"), "TXT"),
-                (format!("_smtp._tls.{host}"), "TXT"),
-                (format!("default._bimi.{host}"), "TXT"),
-            ];
-            for s in &a.selectors {
-                if s.len() > 63
-                    || !s
-                        .bytes()
-                        .all(|c| c.is_ascii_alphanumeric() || b"_-".contains(&c))
-                {
-                    return Err("invalid DKIM selector".into());
-                }
-                names.push((format!("{s}._domainkey.{host}"), "TXT"))
-            }
-            let rows: Vec<_> =
-                stream::iter(names.iter().map(|(n, t)| lookup(a, n, t, a.resolver, true)))
-                    .buffered(a.concurrency as usize)
-                    .collect::<Vec<_>>()
-                    .await
-                    .into_iter()
-                    .collect::<Result<Vec<_>, _>>()?;
-            Ok(
-                json!({"queries":rows,"scope":"DNS policy evidence; no delivery or signature validation"}),
-            )
-        }
-        "http" => http(a, url.clone(), false).await,
-        "web" => http(a, url.clone(), false).await,
-        "whois" | "rdap" => {
-            let path = if host.parse::<IpAddr>().is_ok() {
-                "ip"
-            } else {
-                "domain"
-            };
-            http(
-                a,
-                reqwest::Url::parse(&format!("https://rdap.org/{path}/{host}"))
-                    .map_err(|e| e.to_string())?,
-                true,
-            )
-            .await
-        }
-        "tcp" | "ports" => {
-            let ips = addresses(a, host).await?;
-            let tasks=a.ports.iter().map(|p|{let ip=ips[0];async move{let start=Instant::now();let r=tokio::time::timeout(Duration::from_secs(a.timeout),tokio::net::TcpStream::connect(SocketAddr::new(ip,*p))).await;json!({"ip":ip,"port":p,"open":matches!(r,Ok(Ok(_))),"elapsed_ms":start.elapsed().as_millis()})}});
-            Ok(
-                json!({"ports":stream::iter(tasks).buffered(a.concurrency as usize).collect::<Vec<_>>().await}),
-            )
-        }
-        "ip" => {
-            let ips = addresses(a, host).await?;
-            let mut rows = vec![];
-            for ip in ips.iter().take(4) {
-                rows.push(json!({"ip":ip,"reverse":lookup(a,&dns::reverse(*ip),"PTR",a.resolver,true).await?}));
-            }
-            Ok(json!({"addresses":rows}))
-        }
-        "prop" | "propagation" => {
-            let mut zone = host.to_string();
-            let ns = loop {
-                let r = lookup(a, &zone, "NS", a.resolver, true).await?;
-                if r.outcome != dns::Outcome::NoError {
-                    return Err("no authoritative zone evidence".into());
-                }
-                let ns: Vec<_> = r
-                    .records
-                    .into_iter()
-                    .filter(|r| {
-                        r.rr_class == 1
-                            && r.rr_type == "NS"
-                            && r.name
-                                .trim_end_matches('.')
-                                .eq_ignore_ascii_case(zone.trim_end_matches('.'))
-                    })
-                    .map(|r| r.value)
-                    .collect();
-                if !ns.is_empty() {
-                    break ns;
-                }
-                zone = zone
-                    .split_once('.')
-                    .ok_or("no authoritative zone found")?
-                    .1
-                    .to_string();
-            };
-            let mut rows = vec![];
-            for name in ns.iter().take(6) {
-                match addresses(a, name).await {
-                    Ok(ips) => {
-                        let server = SocketAddr::new(ips[0], 53);
-                        let answer = lookup(a, host, "A", server, false).await?;
-                        let soa = lookup(a, &zone, "SOA", server, false).await?;
-                        rows.push(json!({"server":name,"answer":answer,"soa":soa}));
+    v.height = 0;
+    if !last && v.printed < groups.len() {
+        let live: Vec<(Group, display::Slot)> = (v.printed..groups.len())
+            .map(|i| {
+                let g = groups[i];
+                let slot = match &slots[i] {
+                    Some(row) if i == v.printed => {
+                        let at = v.reveal_at[i].unwrap_or(now);
+                        let lines = r.panel(row, Some(g)).matches('\n').count() as u64;
+                        let queue = slots[i..].iter().take_while(|s| s.is_some()).count();
+                        let dur = (200 + lines * 8).min(450) / queue.clamp(1, 3) as u64;
+                        display::Slot::Reveal(
+                            row,
+                            now.duration_since(at).as_millis() as f64 / dur as f64,
+                        )
                     }
-                    Err(e) => return Err(e),
-                }
-            }
-            Ok(
-                json!({"zone":zone,"servers":rows,"scope":"up to six authoritative servers; A answers and SOA evidence"}),
-            )
-        }
-        "subdomains" => {
-            let labels = [
-                "www",
-                "mail",
-                "smtp",
-                "imap",
-                "pop",
-                "webmail",
-                "autodiscover",
-                "autoconfig",
-                "api",
-                "dev",
-                "staging",
-                "test",
-                "beta",
-                "admin",
-                "portal",
-                "vpn",
-                "remote",
-                "ftp",
-                "ns1",
-                "ns2",
-            ];
-            let control = format!(
-                "wdns-{:x}.{}",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos(),
-                host
-            );
-            let wildcard = lookup(a, &control, "A", a.resolver, true).await?;
-            let rows = stream::iter(labels.iter().map(|n| async move {
-                let name = format!("{n}.{host}");
-                lookup(a, &name, "A", a.resolver, true).await
-            }))
-            .buffered(a.concurrency as usize)
-            .collect::<Vec<_>>()
-            .await
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()?;
-            Ok(
-                json!({"wildcard_control":wildcard,"queries":rows,"scope":"20 common names, A only; not exhaustive discovery"}),
-            )
-        }
-        "ping" => {
-            let ips = addresses(a, host).await?;
-            let mut c = tokio::process::Command::new(ping_program(std::env::consts::OS, ips[0]));
-            c.args([
-                if cfg!(windows) { "-n" } else { "-c" },
-                "3",
-                &ips[0].to_string(),
-            ])
-            .kill_on_drop(true);
-            let out = tokio::time::timeout(Duration::from_secs(a.timeout), c.output())
-                .await
-                .map_err(|_| "ping timeout")?
-                .map_err(|e| e.to_string())?;
-            if !out.status.success() {
-                return Err(format!(
-                    "ping failed: {}{}",
-                    String::from_utf8_lossy(&out.stdout[..out.stdout.len().min(65536)]),
-                    String::from_utf8_lossy(&out.stderr[..out.stderr.len().min(65536)])
-                ));
-            }
-            Ok(
-                json!({"success":true,"raw":String::from_utf8_lossy(&out.stdout[..out.stdout.len().min(65536)])}),
-            )
-        }
-        _ => Err(format!("unknown check: {kind}")),
+                    Some(row) => display::Slot::Ready(row),
+                    None => display::Slot::Running {
+                        elapsed_ms: now.duration_since(started[i]).as_millis(),
+                        partial: partial(g),
+                    },
+                };
+                (g, slot)
+            })
+            .collect();
+        let states: Vec<(Group, Option<bool>)> = groups
+            .iter()
+            .zip(slots)
+            .map(|(g, s)| (*g, s.as_ref().map(|r| r.ok)))
+            .collect();
+        let (text, lines) = r.live(&live, &states, frame, max_lines);
+        s.push_str(&text);
+        v.height = lines;
     }
+    s.push_str("\x1b[J\x1b[?2026l");
+    s
 }
+
 #[tokio::main]
 async fn main() {
     let mut a = Args::parse();
-    if a.target.as_deref() == Some("headers") {
-        a.target = None;
-        a.check = "headers".into();
-    }
-    if !a.records.is_empty() {
-        a.types = a.records.clone();
-    }
-    if a.ports.len() > 10 || a.types.len() > 20 || a.selectors.len() > 8 {
-        eprintln!("too many ports, types or selectors");
-        std::process::exit(2)
-    }
-    if a.target.is_none() && a.check != "headers" {
-        eprintln!("target required; use headers for stdin");
-        std::process::exit(2);
-    }
-    let raw = a.target.clone().unwrap_or_default();
-    if a.check == "headers" {
-        let s = match read_headers(io::stdin()) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("{e}");
-                std::process::exit(2);
-            }
-        };
-        let v = parse_headers(&s);
-        println!(
-            "{}",
-            if a.json {
-                serde_json::to_string(&v).unwrap()
-            } else {
-                serde_json::to_string_pretty(&v).unwrap()
-            }
-        );
+    if a.target.as_deref() == Some("config") {
+        if let Err(e) = config::command(&a.checks) {
+            usage(e);
+        }
         return;
     }
-    let (host, url) = match target(&raw) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("{e}");
-            std::process::exit(2)
-        }
+    let cfg = config::load();
+    let theme = a.theme.or(cfg.theme).unwrap_or_default();
+    let animate = a.animate.or(cfg.animate).unwrap_or_default();
+    let background = cfg.background.unwrap_or(true);
+    if a.target.as_deref() == Some("headers") {
+        let raw = headers::read(io::stdin()).unwrap_or_else(|e| usage(e));
+        let v = headers::parse(&raw);
+        let out = if a.json {
+            serde_json::to_string(&v).unwrap()
+        } else {
+            display::Renderer::new(theme, false, background).headers(&v)
+        };
+        // A closed pipe (e.g. `| head`) is not an error worth a panic.
+        let _ = writeln!(io::stdout().lock(), "{out}");
+        return;
+    }
+    let Some(raw) = a.target.clone() else {
+        usage("target required, e.g. `wheredns example.com` (or `headers` to read stdin)");
     };
-    let kinds: Vec<&str> = match a.check.as_str() {
-        "summary" | "where" => vec!["dns", "rdap", "ip"],
-        "all" => vec![
-            "dns",
-            "email",
-            "web",
-            "rdap",
-            "ip",
-            "tcp",
-            "ping",
-            "prop",
-            "subdomains",
-        ],
-        s => vec![s],
+    let (host, url) = target(&raw).unwrap_or_else(|e| usage(e));
+    let ip = host.parse::<IpAddr>().ok();
+    let groups = plan(&mut a, ip.is_some(), cfg.checks.as_deref());
+    let t = Target {
+        host: host.to_ascii_lowercase(),
+        url,
+        ip,
+        explicit_http: raw.to_ascii_lowercase().starts_with("http://"),
     };
+
+    let renderer = display::Renderer::new(theme, a.json, background);
+    let full = renderer.is_live() && animate == display::Animate::Full;
+    let line =
+        renderer.is_live() && animate == display::Animate::Minimal && io::stderr().is_terminal();
     let start = Instant::now();
-    let work = async {
-        let mut rows = vec![];
-        for kind in kinds {
-            let r = check(&a, &host, &url, kind).await;
-            rows.push(match r {
-                Ok(data) => Row {
-                    check: kind.into(),
-                    ok: true,
-                    data,
-                    error: None,
-                },
-                Err(e) => Row {
-                    check: kind.into(),
-                    ok: false,
-                    data: Value::Null,
-                    error: Some(e),
-                },
-            })
+    let mut stdout = io::stdout().lock();
+    if !a.json {
+        if full {
+            write!(stdout, "\x1b[?25l").ok();
         }
-        rows
+        write!(stdout, "{}", renderer.header(&t.host, &groups)).ok();
+        stdout.flush().ok();
+    }
+
+    let started: Vec<Instant> = groups.iter().map(|_| Instant::now()).collect();
+    let mut pending: FuturesUnordered<_> = groups
+        .iter()
+        .enumerate()
+        .map(|(i, g)| {
+            let (a, t) = (&a, &t);
+            async move { (i, run_group(a, t, *g).await) }
+        })
+        .collect();
+    let mut slots: Vec<Option<Row>> = groups.iter().map(|_| None).collect();
+    let mut view = LiveView {
+        printed: 0,
+        height: 0,
+        reveal_at: groups.iter().map(|_| None).collect(),
     };
-    let (rows, complete) = tokio::select! {r=work=>(r,true),_=tokio::signal::ctrl_c()=>(vec![Row{check:"run".into(),ok:false,data:Value::Null,error:Some("cancelled".into())}],false),_=tokio::time::sleep(Duration::from_secs(a.deadline))=>(vec![Row{check:"run".into(),ok:false,data:Value::Null,error:Some("aggregate deadline exceeded".into())}],false)};
+    let mut frame = 0usize;
+    let mut tick = tokio::time::interval(Duration::from_millis(if full { 40 } else { 90 }));
+    let deadline = tokio::time::sleep(Duration::from_secs(a.deadline));
+    tokio::pin!(deadline);
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
+    let mut stop: Option<&str> = None;
+    let clear = |line: bool| {
+        if line {
+            eprint!("\r\x1b[2K");
+        }
+    };
+    while view.printed < groups.len() {
+        tokio::select! {
+            Some((i, row)) = pending.next() => {
+                slots[i] = Some(row);
+                if a.json {
+                    while view.printed < groups.len() && slots[view.printed].is_some() {
+                        view.printed += 1;
+                    }
+                } else if full {
+                    write!(stdout, "{}", draw(&renderer, &groups, &slots, &mut view, frame, &started, false)).ok();
+                    stdout.flush().ok();
+                } else {
+                    clear(line);
+                    while view.printed < groups.len() {
+                        let Some(row) = &slots[view.printed] else { break };
+                        write!(stdout, "{}", renderer.panel(row, Some(groups[view.printed]))).ok();
+                        view.printed += 1;
+                    }
+                    stdout.flush().ok();
+                }
+            }
+            _ = tick.tick(), if full || line => {
+                frame += 1;
+                if full {
+                    write!(stdout, "{}", draw(&renderer, &groups, &slots, &mut view, frame, &started, false)).ok();
+                    stdout.flush().ok();
+                } else {
+                    let states: Vec<(Group, Option<bool>)> = groups.iter().zip(&slots).map(|(g, s)| (*g, s.as_ref().map(|r| r.ok))).collect();
+                    eprint!("\r\x1b[2K{}", renderer.progress(&states, frame));
+                    io::stderr().flush().ok();
+                }
+            }
+            _ = &mut deadline => { stop = Some("aggregate deadline exceeded"); break; }
+            _ = &mut ctrl_c => { stop = Some("cancelled"); break; }
+        }
+    }
+    drop(pending);
+    clear(line);
+    if full {
+        write!(
+            stdout,
+            "{}",
+            draw(&renderer, &groups, &slots, &mut view, frame, &started, true)
+        )
+        .ok();
+    }
+    let printed = view.printed;
+    let mut rows: Vec<Row> = vec![];
+    for (i, slot) in slots.into_iter().enumerate() {
+        match slot {
+            Some(row) => {
+                if i >= printed && !a.json {
+                    write!(stdout, "{}", renderer.panel(&row, Some(groups[i]))).ok();
+                }
+                rows.push(row)
+            }
+            None if stop.is_some() => rows.push(Row {
+                check: groups[i].id().into(),
+                ok: false,
+                elapsed_ms: start.elapsed().as_millis(),
+                data: Value::Null,
+                error: Some(stop.unwrap().into()),
+            }),
+            None => {}
+        }
+    }
+    let complete = stop.is_none();
+    if !complete {
+        rows.push(Row {
+            check: "run".into(),
+            ok: false,
+            elapsed_ms: start.elapsed().as_millis(),
+            data: Value::Null,
+            error: Some(stop.unwrap().into()),
+        });
+    }
     let ok = complete && rows.iter().all(|r| r.ok);
     let report = Report {
-        schema_version: 1,
-        target: host,
+        schema_version: SCHEMA_VERSION,
+        target: t.host.clone(),
         vantage: "local",
         elapsed_ms: start.elapsed().as_millis(),
         complete,
         results: rows,
     };
-    println!(
-        "{}",
-        if a.json {
-            serde_json::to_string(&report).unwrap()
-        } else {
-            report
-                .results
-                .iter()
-                .map(|r| {
-                    format!(
-                        "{}: {}\n{}",
-                        r.check,
-                        if r.ok { "completed" } else { "failed" },
-                        r.error
-                            .clone()
-                            .unwrap_or_else(|| serde_json::to_string_pretty(&r.data).unwrap())
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
+    if a.json {
+        writeln!(stdout, "{}", serde_json::to_string(&report).unwrap()).ok();
+    } else {
+        write!(stdout, "{}", renderer.footer(&report)).ok();
+        if full {
+            write!(stdout, "\x1b[?25h").ok();
         }
-    );
+    }
+    stdout.flush().ok();
     if !ok {
         std::process::exit(if complete { 1 } else { 130 })
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
     fn raw_headers_and_platform_policy() {
-        assert!(read_headers(&vec![b' '; 65537][..]).is_err());
-        assert!(read_headers(&b"Subject: x\n\xff"[..]).is_err());
+        assert!(headers::read(&vec![b' '; 65537][..]).is_err());
+        assert!(headers::read(&b"Subject: x\n\xff"[..]).is_err());
         struct Broken;
-        impl Read for Broken {
+        impl io::Read for Broken {
             fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
                 Err(io::Error::other("fixture"))
             }
         }
-        assert!(read_headers(Broken).is_err());
-        assert_eq!(parse_headers("\nSubject: body")["fields"], json!([]));
-        assert_eq!(parse_headers(" orphan\nSubject: x")["malformed_lines"], 1);
+        assert!(headers::read(Broken).is_err());
+        assert_eq!(
+            headers::parse("\nSubject: body")["fields"],
+            serde_json::json!([])
+        );
+        assert_eq!(headers::parse(" orphan\nSubject: x")["malformed_lines"], 1);
         for ip in [
             "fec0::1",
             "2001:db8::1",
@@ -625,6 +807,7 @@ mod tests {
         for ip in ["1.1.1.1", "2606:4700:4700::1111"] {
             assert!(public(ip.parse().unwrap()));
         }
+        use checks::ping_program;
         assert_eq!(ping_program("macos", "::1".parse().unwrap()), "ping6");
         assert_eq!(ping_program("linux", "::1".parse().unwrap()), "ping");
         assert_eq!(ping_program("windows", "::1".parse().unwrap()), "ping");
@@ -637,10 +820,14 @@ mod tests {
         );
         assert!(target("https://user:pass@example.com").is_err());
         assert!(target("file:///etc/passwd").is_err());
+        assert_eq!(
+            target("example.com/path?q=1").unwrap().1.as_str(),
+            "https://example.com/path?q=1"
+        );
     }
     #[test]
     fn header_fixture() {
-        let v=parse_headers("From: sender@example.test\nAuthentication-Results: untrusted\nX-Test: a\nX-Test: b\nbroken");
+        let v=headers::parse("From: sender@example.test\nAuthentication-Results: untrusted\nX-Test: a\nX-Test: b\nbroken");
         assert_eq!(v["fields"].as_array().unwrap().len(), 4);
         assert_eq!(v["malformed_lines"], 1);
         assert_eq!(v["authentication_results_untrusted"], true);
@@ -656,5 +843,29 @@ mod tests {
         ] {
             assert!(!public(s.parse().unwrap()))
         }
+    }
+    #[test]
+    fn ping_parsing_handles_each_platform() {
+        let mac = "PING 1.1.1.1: 56 data bytes\n64 bytes from 1.1.1.1: icmp_seq=0 ttl=57 time=12.3 ms\nRequest timeout for icmp_seq 1\n64 bytes from 1.1.1.1: icmp_seq=2 ttl=57 time=10.0 ms\n";
+        let s = checks::parse_ping(mac, 10);
+        assert_eq!(&s[..3], &[Some(12.3), None, Some(10.0)]);
+        let linux = "64 bytes from 1.1.1.1: icmp_seq=1 ttl=57 time=9.1 ms\n64 bytes from 1.1.1.1: icmp_seq=3 ttl=57 time=8 ms\n";
+        let s = checks::parse_ping(linux, 10);
+        assert_eq!(&s[..3], &[Some(9.1), None, Some(8.0)]);
+        let win = "Reply from 1.1.1.1: bytes=32 time=14ms TTL=57\nReply from 1.1.1.1: bytes=32 time<1ms TTL=57\n";
+        let s = checks::parse_ping(win, 10);
+        assert_eq!(&s[..2], &[Some(14.0), Some(1.0)]);
+    }
+    #[test]
+    fn provider_attribution() {
+        let p = checks::dns_hosting_providers(&[
+            "dns1.p08.nsone.net.".into(),
+            "ns-421.awsdns-52.com".into(),
+            "ns1.example-host.net".into(),
+        ]);
+        assert_eq!(p[0]["name"], "NS1");
+        assert_eq!(p[1]["name"], "Amazon Route 53");
+        assert_eq!(p[2]["name"], "example-host.net");
+        assert_eq!(p[2]["basis"], "nameserver-domain");
     }
 }

@@ -1,14 +1,42 @@
-# Release preparation (no release published)
+# Releasing
 
-CI builds native Linux x86_64, macOS ARM64/Intel and Windows x86_64 binaries.
-For an explicitly approved version, download successful CI artifacts, extract and
-run --version on each platform, archive binary with README and license, compute
-SHA-256 for each archive, and attach those exact archives to a versioned release.
-Do not advertise installation until all artifacts and hashes are verified.
+1. Set `version` in `Cargo.toml`, run `cargo build` to update `Cargo.lock`, and
+   merge to `main`.
+2. Tag and push:
 
-Homebrew: render wheredns.rb.in with the version, actual release archive URLs and
-SHA-256 values. Test locally with brew install --build-from-source or the verified
-bottle archive before committing the formula to a separate tap.
-Windows: distribute a ZIP containing wheredns.exe and README; Scoop manifest uses
-that verified ZIP URL/hash, bin wheredns.exe and version. Submit WinGet only after
-a published immutable version exists. No registry or tap is published by CI.
+   ```sh
+   git tag v0.1.0
+   git push origin v0.1.0
+   ```
+
+3. `.github/workflows/release.yml` builds these archives, checks that the tag
+   matches `Cargo.toml`, and publishes a GitHub release with `SHA256SUMS`,
+   `wheredns.rb` and `wheredns.json`:
+
+   | Target | Archive |
+   |---|---|
+   | `aarch64-apple-darwin` | `.tar.gz` |
+   | `x86_64-apple-darwin` | `.tar.gz` |
+   | `x86_64-unknown-linux-gnu` | `.tar.gz` |
+   | `x86_64-pc-windows-msvc` | `.zip` |
+
+   Each archive contains `wheredns` (or `wheredns.exe`), `README.md` and `LICENSE`.
+
+4. Copy the release's `wheredns.rb` to `Formula/wheredns.rb` in
+   [Shroomate/homebrew-tap](https://github.com/Shroomate/homebrew-tap) and push.
+   Check it with:
+
+   ```sh
+   brew update
+   brew install shroomate/tap/wheredns
+   brew test wheredns
+   brew audit --strict --online shroomate/tap/wheredns
+   ```
+
+`wheredns.json` is a Scoop manifest for a Scoop bucket.
+
+To render a template by hand from a downloaded `SHA256SUMS`:
+
+```sh
+packaging/render.sh 0.1.0 SHA256SUMS packaging/wheredns.rb.in > wheredns.rb
+```

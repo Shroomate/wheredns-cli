@@ -1,5 +1,8 @@
 name: CI
-on: [push, pull_request]
+on:
+  push:
+    branches: [main]
+  pull_request:
 jobs:
   test:
     strategy:
@@ -16,19 +19,11 @@ jobs:
           components: rustfmt, clippy
       - run: cargo fmt --check
       - run: cargo test --locked
-      - run: cargo clippy --locked -- -D warnings
+      - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo build --locked
-      - name: Offline review regressions
+      - name: Loopback regressions
         if: runner.os == 'Linux'
         run: |
-          python3 tests/review_regressions.py
+          python3 tests/loopback_regressions.py
           python3 tests/dns_eligibility.py
       - run: cargo build --locked --release
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: wheredns-${{ matrix.os }}
-          path: |
-            target/release/wheredns
-            target/release/wheredns.exe
-          if-no-files-found: error
