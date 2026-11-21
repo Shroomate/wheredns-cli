@@ -13,7 +13,7 @@ jobs:
       CARGO_INCREMENTAL: 0
       CARGO_BUILD_JOBS: 1
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
