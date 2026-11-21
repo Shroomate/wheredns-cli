@@ -1123,7 +1123,11 @@ impl Renderer {
                 sp("headers", Tone::Title(0)),
                 sp(" email header trace", Tone::Dim),
             ],
-            vec![sp(" ", Tone::Fg)],
+            vec![
+                sp(" ", Tone::Fg),
+                sp("offline", Tone::Dim),
+                sp(" ", Tone::Fg),
+            ],
             body,
         );
         out.truncate(out.trim_end_matches('\n').len());
@@ -1709,7 +1713,13 @@ impl Renderer {
                     }
                     for r in records {
                         let mut v = str_of(r, "value").to_string();
-                        if ty != "TXT" {
+                        if ty == "MX" && v.ends_with(" .") {
+                            // RFC 7505 null MX: the domain accepts no mail.
+                            v = format!(
+                                "{} . (null MX: accepts no mail)",
+                                v.trim_end_matches(" .")
+                            );
+                        } else if ty != "TXT" {
                             v = v.trim_end_matches('.').to_string();
                         }
                         if display_width(&v) > 240 {

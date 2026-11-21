@@ -1,24 +1,41 @@
-# wheredns
+<p align="center">
+  <img src="docs/images/banner.png" alt="wheredns: DNS, email, web and network diagnostics from your terminal" width="900">
+</p>
 
-DNS, email, registration, web and network diagnostics for a domain, IP address
-or URL. All checks run from the local machine.
+<p align="center">
+  <a href="https://github.com/Shroomate/wheredns-cli/actions/workflows/ci.yml"><img src="https://github.com/Shroomate/wheredns-cli/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/Shroomate/wheredns-cli/releases/latest"><img src="https://img.shields.io/github/v/release/Shroomate/wheredns-cli?color=5fd7ff&label=release" alt="Latest release"></a>
+  <img src="https://img.shields.io/badge/platforms-macOS%20%C2%B7%20Linux%20%C2%B7%20Windows-87d75f" alt="macOS, Linux, Windows">
+  <a href="docs/TESTING.md"><img src="https://img.shields.io/badge/tests-78%20offline%20cases-d7af5f" alt="78 offline test cases"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/Shroomate/wheredns-cli?color=af87d7" alt="MIT license"></a>
+</p>
 
-```sh
-wheredns github.com
-```
+<p align="center">
+  Point it at a domain, IP address or URL to see who hosts the DNS, whether email
+  is set up correctly, how the site responds and what the network looks like.
+  Everything runs from your machine: no account, no API key, no telemetry.
+</p>
 
 ## Install
 
-Homebrew (macOS and Linux):
+**Homebrew** (macOS and Linux)
 
 ```sh
 brew install shroomate/tap/wheredns
 ```
 
-Prebuilt archives for macOS, Linux and Windows are attached to each
-[release](https://github.com/Shroomate/wheredns-cli/releases).
+**Prebuilt binaries**: download, extract, and put `wheredns` on your `PATH`.
 
-From source, with a stable Rust toolchain:
+| Platform | Download |
+|---|---|
+| macOS, Apple silicon | [`aarch64-apple-darwin.tar.gz`](https://github.com/Shroomate/wheredns-cli/releases/latest) |
+| macOS, Intel | [`x86_64-apple-darwin.tar.gz`](https://github.com/Shroomate/wheredns-cli/releases/latest) |
+| Linux x86_64 | [`x86_64-unknown-linux-gnu.tar.gz`](https://github.com/Shroomate/wheredns-cli/releases/latest) |
+| Windows x86_64 | [`x86_64-pc-windows-msvc.zip`](https://github.com/Shroomate/wheredns-cli/releases/latest) |
+
+Each release includes `SHA256SUMS`.
+
+**From source** (stable Rust)
 
 ```sh
 cargo install --git https://github.com/Shroomate/wheredns-cli --locked
@@ -26,23 +43,21 @@ cargo install --git https://github.com/Shroomate/wheredns-cli --locked
 
 Cargo installs to `~/.cargo/bin`. Add it to `PATH` if `wheredns` is not found.
 
-## Usage
-
-```
-wheredns TARGET [CHECK ...] [OPTIONS]
-```
-
-With no checks, a domain runs `where email ping whois web` and an IP address
-runs `ping whois web ip`. Checks run concurrently.
+## Quick start
 
 ```sh
-wheredns google.com email dkim:20230601
-wheredns example.com dns A MX TXT propagation
-wheredns 8.8.8.8 blacklist ip
-wheredns cloudflare.com web ports 22 443 8443
-wheredns example.com all
-pbpaste | wheredns headers
+wheredns github.com
 ```
+
+<p align="center">
+  <img src="docs/images/hero.png" alt="wheredns cloudflare.com: DNS host, registrar, ping chart, HTTP timing and TLS certificate" width="820">
+</p>
+
+With no checks, a domain runs `where email ping whois web` and an IP address
+runs `ping whois web ip`. Checks run concurrently, and each panel shows up as
+its results arrive.
+
+## What it checks
 
 | Check | Output |
 |---|---|
@@ -61,7 +76,54 @@ pbpaste | wheredns headers
 | `headers` | Email header read from stdin: hop trace, delays, authentication results |
 | `all` | Every check except `headers` |
 
-### Options
+```sh
+wheredns google.com email dkim:20230601
+wheredns example.com dns A MX TXT propagation
+wheredns 8.8.8.8 blacklist ip
+wheredns cloudflare.com web ports 22 443 8443
+wheredns example.com all
+pbpaste | wheredns headers
+```
+
+## Screenshots
+
+<table>
+  <tr>
+    <td width="50%" valign="top">
+      <b>Email authentication</b><br>
+      <sub><code>wheredns google.com email</code></sub><br><br>
+      <img src="docs/images/email.png" alt="Email check: MX, SPF, DMARC, DKIM, MTA-STS, TLS-RPT and BIMI">
+    </td>
+    <td width="50%" valign="top">
+      <b>Records and propagation</b><br>
+      <sub><code>wheredns example.com dns A AAAA MX NS TXT propagation</code></sub><br><br>
+      <img src="docs/images/dns.png" alt="DNS records table and per-nameserver propagation comparison">
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <b>IP reputation and reachability</b><br>
+      <sub><code>wheredns 8.8.8.8 ip blacklist ports</code></sub><br><br>
+      <img src="docs/images/ip.png" alt="Blocklist results, ASN and network owner, and TCP port scan">
+    </td>
+    <td width="50%" valign="top">
+      <b>Email header trace (offline)</b><br>
+      <sub><code>pbpaste | wheredns headers</code></sub><br><br>
+      <img src="docs/images/headers.png" alt="Email header trace with hops, delays and authentication results">
+    </td>
+  </tr>
+</table>
+
+### Themes
+
+Five built-in themes. Pick one with `--theme`, or save it with
+`wheredns config set theme NAME`.
+
+<p align="center">
+  <img src="docs/images/themes.png" alt="btop, phosphor, tty, purple and amber themes" width="900">
+</p>
+
+## Options
 
 | Option | Default | |
 |---|---|---|
@@ -93,7 +155,10 @@ Settings are stored in `~/.config/wheredns/config` (or
 `$XDG_CONFIG_HOME/wheredns/config`). Command-line flags override
 `WHEREDNS_THEME` and `WHEREDNS_ANIMATE`, which override the file.
 
-### Exit codes
+### Scripting
+
+`--json` prints one versioned document per run, and the exit code tells you
+what happened:
 
 | Code | Meaning |
 |---|---|
@@ -104,6 +169,10 @@ Settings are stored in `~/.config/wheredns/config` (or
 
 NXDOMAIN and NODATA are results, not failures. SERVFAIL, REFUSED, failed
 subqueries and a nonzero `ping` exit fail the check.
+
+```sh
+wheredns example.com email --json | jq '.results[0].data.findings[] | {name, kind}'
+```
 
 ## Network behavior
 
@@ -121,17 +190,29 @@ subqueries and a nonzero `ping` exit fail the check.
 - `headers` reads at most 64 KiB of UTF-8 from stdin and makes no network
   requests.
 
+## Testing
+
+78 test cases, all offline, run in CI on Linux, Windows and macOS (ARM64 and
+Intel). DNS and HTTP behavior is tested against loopback fixtures, so results
+never depend on live internet data. The full list is in
+[docs/TESTING.md](docs/TESTING.md).
+
+```sh
+cargo test --locked
+cargo build && python3 tests/loopback_regressions.py && python3 tests/dns_eligibility.py
+```
+
 ## Development
 
 ```sh
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
-cargo build && python3 tests/loopback_regressions.py && python3 tests/dns_eligibility.py
 ```
 
-The Python suites run the debug binary against loopback DNS and HTTP fixtures.
-Release steps are in [packaging/README.md](packaging/README.md).
+Screenshots are regenerated with `scripts/screenshots/generate.sh`. Release
+steps are in [packaging/README.md](packaging/README.md). Report security issues
+as described in [SECURITY.md](SECURITY.md).
 
 ## License
 
