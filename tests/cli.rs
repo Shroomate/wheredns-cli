@@ -170,9 +170,9 @@ async fn run_with_dns(
             packet = socket.recv_from(&mut buffer) => {
                 let (size, peer) = packet.unwrap();
                 let mut message = Message::from_vec(&buffer[..size]).unwrap();
-                let question = &message.queries()[0];
+                let question = &message.queries[0];
                 queries.push((question.name().clone(), question.query_type()));
-                message.set_message_type(MessageType::Response);
+                message.metadata.message_type = MessageType::Response;
                 respond(&mut message);
                 socket.send_to(&message.to_vec().unwrap(), peer).await.unwrap();
             }
@@ -189,7 +189,7 @@ async fn propagation_looks_up_parent_zone_after_nxdomain() {
         "missing.example.test",
         &["propagation", "--json"],
         |response| {
-            let name = response.queries()[0].name();
+            let name = response.queries[0].name();
             if name == &zone {
                 response.add_answer(Record::from_rdata(
                     zone.clone(),
@@ -197,7 +197,7 @@ async fn propagation_looks_up_parent_zone_after_nxdomain() {
                     RData::NS(hickory_proto::rr::rdata::NS(server.clone())),
                 ));
             } else {
-                response.set_response_code(ResponseCode::NXDomain);
+                response.metadata.response_code = ResponseCode::NXDomain;
             }
         },
     )
@@ -217,11 +217,11 @@ async fn dns_labels_cname_without_requested_record_as_nodata() {
     let (out, _) = run_with_dns("www.example.test", &["dns", "AAAA", "--json"], |response| {
         let zone = Name::from_ascii("example.test.").unwrap();
         response.add_answer(Record::from_rdata(
-            response.queries()[0].name().clone(),
+            response.queries[0].name().clone(),
             60,
             RData::CNAME(hickory_proto::rr::rdata::CNAME(zone.clone())),
         ));
-        response.add_name_server(Record::from_rdata(
+        response.add_authority(Record::from_rdata(
             zone,
             60,
             RData::SOA(SOA::new(
@@ -247,7 +247,7 @@ async fn dns_labels_cname_without_requested_record_as_nodata() {
 #[tokio::test]
 async fn terminal_dns_groups_queries_and_records() {
     let (out, _) = run_with_dns("example.test", &["dns", "A", "AAAA"], |response| {
-        let question = &response.queries()[0];
+        let question = &response.queries[0];
         if question.query_type() == RecordType::A {
             response.add_answer(Record::from_rdata(
                 question.name().clone(),

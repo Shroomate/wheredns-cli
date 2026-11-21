@@ -53,14 +53,13 @@ pub async fn query(
 ) -> Result<Answer, String> {
     let ty = RecordType::from_str(kind).map_err(|e| e.to_string())?;
     let id = rand::random();
-    let mut q = Message::new();
-    q.set_id(id)
-        .set_recursion_desired(recurse)
-        .set_authentic_data(recurse)
-        .add_query(Query::query(
-            Name::from_ascii(name).map_err(|e| e.to_string())?,
-            ty,
-        ));
+    let mut owner = Name::from_ascii(name).map_err(|e| e.to_string())?;
+    owner.set_fqdn(true);
+    let mut q = Message::query();
+    q.metadata.id = id;
+    q.metadata.recursion_desired = recurse;
+    q.metadata.authentic_data = recurse;
+    q.add_query(Query::query(owner, ty));
     let bytes = q.to_vec().map_err(|e| e.to_string())?;
     let socket = UdpSocket::bind(if server.is_ipv4() {
         "0.0.0.0:0"
@@ -75,7 +74,7 @@ pub async fn query(
     let n = socket.recv(&mut buf).await.map_err(|e| e.to_string())?;
     let mut m = Message::from_vec(&buf[..n]).map_err(|e| e.to_string())?;
     validate(&m, &q)?;
-    if m.truncated() {
+    if m.metadata.truncation {
         let mut tcp = TcpStream::connect(server)
             .await
             .map_err(|e| e.to_string())?;
@@ -89,36 +88,43 @@ pub async fn query(
         m = Message::from_vec(&buf).map_err(|e| e.to_string())?;
     }
     validate(&m, &q)?;
-    if m.truncated() {
+    if m.metadata.truncation {
         return Err("incomplete TCP DNS response".into());
     }
     if !matches!(
-        m.response_code(),
+        m.metadata.response_code,
         ResponseCode::NoError | ResponseCode::NXDomain
     ) {
-        return Err(format!("DNS resolver failure: {}", m.response_code()));
+        return Err(format!(
+            "DNS resolver failure: {}",
+            m.metadata.response_code
+        ));
     }
     Ok(Answer {
         name: name.into(),
         rr_type: kind.into(),
         server: server.to_string(),
-        status: response_status(&m, &q.queries()[0]),
-        outcome: if m.response_code() == ResponseCode::NoError {
+        status: response_status(&m, &q.queries[0]),
+        outcome: if m.metadata.response_code == ResponseCode::NoError {
             Outcome::NoError
         } else {
             Outcome::NxDomain
         },
-        authoritative: m.authoritative(),
-        authenticated: m.authentic_data(),
+        authoritative: m.metadata.authoritative,
+        authenticated: m.metadata.authentic_data,
         records: m
-            .answers()
+            .answers
             .iter()
             .map(|r| Record {
-                name: r.name().to_string(),
+                name: r.name.to_string(),
                 rr_type: r.record_type().to_string(),
-                rr_class: u16::from(r.dns_class()),
-                ttl: r.ttl(),
-                value: r.data().map(render).unwrap_or_default(),
+                rr_class: u16::from(r.dns_class),
+                ttl: r.ttl,
+                value: if matches!(r.data, RData::Update0(_)) {
+                    String::new()
+                } else {
+                    render(&r.data)
+                },
             })
             .collect(),
     })
@@ -128,7 +134,7 @@ pub async fn query(
 fn render(data: &RData) -> String {
     match data {
         RData::Unknown { code, rdata } => {
-            let b = rdata.anything();
+            let b = &rdata.anything;
             match (u16::from(*code), b.len() >= 4) {
                 // DS / CDS: key tag, algorithm, digest type, digest (hex)
                 (43 | 59, true) => format!(
@@ -181,34 +187,34 @@ fn base64(bytes: &[u8]) -> String {
 }
 
 fn response_status(message: &Message, question: &Query) -> String {
-    let code = message.response_code();
+    let code = message.metadata.response_code;
     if code != ResponseCode::NoError {
         return code.to_string();
     }
     let mut owner = question.name();
     for _ in 0..=MAX_CNAME_LINKS {
         let records = message
-            .answers()
+            .answers
             .iter()
-            .filter(|r| r.name() == owner && r.dns_class() == question.query_class());
+            .filter(|r| &r.name == owner && r.dns_class == question.query_class());
         if records.clone().any(|r| {
-            r.data().is_some()
+            !matches!(r.data, RData::Update0(_))
                 && (r.record_type() == question.query_type()
                     || question.query_type() == RecordType::ANY)
         }) {
             return code.to_string();
         }
-        let mut aliases = records.filter_map(|r| match r.data() {
-            Some(RData::CNAME(target)) => Some(&target.0),
+        let mut aliases = records.filter_map(|r| match &r.data {
+            RData::CNAME(target) => Some(&target.0),
             _ => None,
         });
         match (aliases.next(), aliases.next()) {
             (Some(target), None) => owner = target,
             (None, _) => {
                 let mut authority = message
-                    .name_servers()
+                    .authorities
                     .iter()
-                    .filter(|r| r.dns_class() == question.query_class());
+                    .filter(|r| r.dns_class == question.query_class());
                 // An NS-only authority section is a referral (RFC 2308, §2.2).
                 return if authority.clone().any(|r| r.record_type() == RecordType::NS)
                     && !authority.any(|r| r.record_type() == RecordType::SOA)
@@ -225,10 +231,10 @@ fn response_status(message: &Message, question: &Query) -> String {
 }
 
 fn validate(m: &Message, q: &Message) -> Result<(), String> {
-    if m.id() != q.id()
-        || m.queries() != q.queries()
-        || m.message_type() != hickory_proto::op::MessageType::Response
-        || m.op_code() != q.op_code()
+    if m.metadata.id != q.metadata.id
+        || m.queries != q.queries
+        || m.metadata.message_type != hickory_proto::op::MessageType::Response
+        || m.metadata.op_code != q.metadata.op_code
     {
         return Err("DNS response mismatch".into());
     }
@@ -360,10 +366,8 @@ mod tests {
             let mut b = [0; 512];
             let (n, p) = s.recv_from(&mut b).await.unwrap();
             let q = Message::from_vec(&b[..n]).unwrap();
-            let mut r = Message::new();
-            r.set_id(q.id())
-                .set_message_type(hickory_proto::op::MessageType::Response)
-                .add_queries(q.queries().iter().cloned());
+            let mut r = Message::response(q.metadata.id, q.metadata.op_code);
+            r.add_queries(q.queries.iter().cloned());
             r.add_answer(hickory_proto::rr::Record::from_rdata(
                 Name::from_ascii("example.test.").unwrap(),
                 60,
@@ -382,8 +386,9 @@ mod hostile_tests {
     use super::*;
     use hickory_proto::op::{MessageType, OpCode, ResponseCode};
     fn question() -> Message {
-        let mut q = Message::new();
-        q.set_id(123).add_query(Query::query(
+        let mut q = Message::query();
+        q.metadata.id = 123;
+        q.add_query(Query::query(
             Name::from_ascii("example.test.").unwrap(),
             RecordType::A,
         ));
@@ -391,7 +396,7 @@ mod hostile_tests {
     }
     fn response(q: &Message) -> Message {
         let mut r = q.clone();
-        r.set_message_type(MessageType::Response);
+        r.metadata.message_type = MessageType::Response;
         r
     }
     #[test]
@@ -438,16 +443,16 @@ mod hostile_tests {
             let mut r = good.clone();
             match mode {
                 0 => {
-                    r.set_id(124);
+                    r.metadata.id = 124;
                 }
                 1 => {
-                    r.set_op_code(OpCode::Status);
+                    r.metadata.op_code = OpCode::Status;
                 }
                 2 => {
-                    r.set_message_type(MessageType::Query);
+                    r.metadata.message_type = MessageType::Query;
                 }
                 _ => {
-                    r.queries_mut()[0].set_query_type(RecordType::MX);
+                    r.queries[0].set_query_type(RecordType::MX);
                 }
             }
             assert!(validate(&r, &q).is_err());
@@ -474,9 +479,9 @@ mod hostile_tests {
                 let (n, p) = udp.recv_from(&mut b).await.unwrap();
                 let q = Message::from_vec(&b[..n]).unwrap();
                 let mut r = response(&q);
-                r.set_truncated(true);
+                r.metadata.truncation = true;
                 if mode == "udp_id" {
-                    r.set_id(q.id().wrapping_add(1));
+                    r.metadata.id = q.metadata.id.wrapping_add(1);
                 }
                 udp.send_to(&r.to_vec().unwrap(), p).await.unwrap();
                 if mode == "udp_id" {
@@ -495,19 +500,19 @@ mod hostile_tests {
                 let mut r = response(&q);
                 match mode {
                     "tc" => {
-                        r.set_truncated(true);
+                        r.metadata.truncation = true;
                     }
                     "id" => {
-                        r.set_id(q.id().wrapping_add(1));
+                        r.metadata.id = q.metadata.id.wrapping_add(1);
                     }
                     "question" => {
-                        r.queries_mut()[0].set_query_type(RecordType::MX);
+                        r.queries[0].set_query_type(RecordType::MX);
                     }
                     "opcode" => {
-                        r.set_op_code(OpCode::Status);
+                        r.metadata.op_code = OpCode::Status;
                     }
                     "qr" => {
-                        r.set_message_type(MessageType::Query);
+                        r.metadata.message_type = MessageType::Query;
                     }
                     _ => {}
                 }
@@ -546,7 +551,7 @@ mod hostile_tests {
                 let (n, p) = udp.recv_from(&mut b).await.unwrap();
                 let q = Message::from_vec(&b[..n]).unwrap();
                 let mut r = response(&q);
-                r.set_response_code(code);
+                r.metadata.response_code = code;
                 udp.send_to(&r.to_vec().unwrap(), p).await.unwrap();
             });
             let r = query("example.test.", "A", addr, true).await;
