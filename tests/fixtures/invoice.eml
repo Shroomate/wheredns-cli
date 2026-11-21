@@ -1,0 +1,23 @@
+Return-Path: <billing@example.com>
+Received: from mail-sor-f41.google.com (mail-sor-f41.google.com [209.85.220.41])
+        by mx.example.net with SMTPS id a1si123456qkb.42.2026.11.20.09.14.07
+        for <you@example.net>; Fri, 20 Nov 2026 09:14:09 -0800 (PST)
+Received: from mta.example.com (mta.example.com [198.51.100.24])
+        by mail-sor-f41.google.com with ESMTPS id x7so881234qkb.3
+        for <you@example.net>; Fri, 20 Nov 2026 09:14:07 -0800 (PST)
+Received: from app-7.internal (app-7.internal [10.0.4.17])
+        by mta.example.com (Postfix) with ESMTP id 4F2A1C0042
+        for <you@example.net>; Fri, 20 Nov 2026 09:14:02 -0800 (PST)
+Authentication-Results: mx.example.net;
+       dkim=pass header.i=@example.com header.s=s1 header.b=Xk3fQ9a1;
+       spf=pass (domain of billing@example.com designates 198.51.100.24 as permitted sender) smtp.mailfrom=billing@example.com;
+       dmarc=pass (p=REJECT sp=REJECT dis=NONE) header.from=example.com
+From: Example Billing <billing@example.com>
+To: you@example.net
+Subject: Your November invoice
+Date: Fri, 20 Nov 2026 09:14:01 -0800
+Message-ID: <20261120171401.4F2A1C0042@mta.example.com>
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+
+body
