@@ -41,7 +41,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
-          path: wheredns-*.*
+          path: |
+            wheredns-*.tar.gz
+            wheredns-*.zip
           if-no-files-found: error
 
   release:
@@ -57,7 +59,7 @@ jobs:
         run: |
           version=${GITHUB_REF_NAME#v}
           cd dist
-          sha256sum wheredns-* > SHA256SUMS
+          sha256sum wheredns-*.tar.gz wheredns-*.zip > SHA256SUMS
           cd ..
           packaging/render.sh "$version" dist/SHA256SUMS packaging/wheredns.rb.in > dist/wheredns.rb
           packaging/render.sh "$version" dist/SHA256SUMS packaging/scoop.json.in > dist/wheredns.json
