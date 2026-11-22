@@ -1732,7 +1732,7 @@ dependencies = [
 
 [[package]]
 name = "wheredns"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "futures-util",

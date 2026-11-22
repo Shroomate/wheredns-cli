@@ -6,7 +6,7 @@
   <a href="https://github.com/Shroomate/wheredns-cli/actions/workflows/ci.yml"><img src="https://github.com/Shroomate/wheredns-cli/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://github.com/Shroomate/wheredns-cli/releases/latest"><img src="https://img.shields.io/github/v/release/Shroomate/wheredns-cli?color=5fd7ff&label=release" alt="Latest release"></a>
   <img src="https://img.shields.io/badge/platforms-macOS%20%C2%B7%20Linux%20%C2%B7%20Windows-87d75f" alt="macOS, Linux, Windows">
-  <a href="docs/TESTING.md"><img src="https://img.shields.io/badge/tests-78%20offline%20cases-d7af5f" alt="78 offline test cases"></a>
+  <a href="docs/TESTING.md"><img src="https://img.shields.io/badge/tests-84%20offline%20cases-d7af5f" alt="84 offline test cases"></a>
   <a href="LICENSE"><img src="https://img.shields.io/github/license/Shroomate/wheredns-cli?color=af87d7" alt="MIT license"></a>
 </p>
 
@@ -197,7 +197,7 @@ wheredns example.com email --json | jq '.results[0].data.findings[] | {name, kin
 
 ## Testing
 
-78 test cases, all offline, run in CI on Linux, Windows and macOS (ARM64 and
+84 test cases, all offline, run in CI on Linux, Windows and macOS (ARM64 and
 Intel). DNS and HTTP behavior is tested against loopback fixtures, so results
 never depend on live internet data. The full list is in
 [docs/TESTING.md](docs/TESTING.md).

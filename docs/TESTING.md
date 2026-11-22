@@ -21,12 +21,12 @@ python3 tests/dns_eligibility.py         # which DNS answers count as evidence
 
 | Suite | Cases | What it covers |
 |---|---:|---|
-| Unit (`src/`) | 15 | DNS wire parsing and hostile replies, header parsing, URL normalization, address policy, ping output on each platform, provider attribution, TLS error text, settings validation |
+| Unit (`src/`) | 21 | DNS wire parsing and hostile replies, header parsing, URL normalization, address policy, ping output on each platform, provider attribution, TLS error text, settings validation, theme escape output, panel width and layout |
 | CLI contract (`tests/cli.rs`) | 7 | `--help`/`--version`, usage errors, JSON schema, redirect evidence on HTTP failure, NXDOMAIN parent-zone lookup, NODATA labelling, terminal DNS layout |
 | Scenarios (`tests/scenarios.rs`) | 14 | End-to-end runs of the binary, listed below |
 | Loopback regressions (`tests/loopback_regressions.py`) | 12 | REFUSED, SERVFAIL, truncated TCP, malformed PTR, unrelated owners, nonzero ping, invalid and oversized headers |
 | DNS eligibility (`tests/dns_eligibility.py`) | 30 | Which answers (by rcode, class and owner) count as evidence for each check |
-| **Total** | **78** | |
+| **Total** | **84** | |
 
 ### Scenarios
 

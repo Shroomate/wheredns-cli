@@ -4,10 +4,14 @@ import re, sys, html
 src, out, title = sys.argv[1], sys.argv[2], sys.argv[3]
 maxlines = int(sys.argv[4]) if len(sys.argv) > 4 else 10**9
 data = open(src, 'rb').read().decode('utf-8', 'replace').replace('\r\n', '\n').replace('\r', '')
+# Drop cursor and erase sequences (e.g. erase-line); only colors matter here.
+data = re.sub(r'\x1b\[[0-9;?]*[A-La-ln-z]', '', data)
 lines = data.split('\n')
 while lines and not re.sub(r'\x1b\[[0-9;]*m', '', lines[-1]).strip(): lines.pop()
 lines = lines[:maxlines]
-bg_default = None
+from collections import Counter
+bg_cover = Counter()
+chars = 0
 def parse(line):
     st = {'fg': None, 'bg': None, 'b': False, 'd': False, 'i': False, 'u': False}
     spans = []
@@ -43,10 +47,14 @@ for ln in lines:
         if st['d']: css.append('opacity:.6')
         if st['i']: css.append('font-style:italic')
         if st['u']: css.append('text-decoration:underline')
-        if st['bg'] and not bg_default: bg_default = st['bg']
+        chars += len(txt.strip())
+        if st['bg']: bg_cover[st['bg']] += len(txt)
         row.append('<span style="%s">%s</span>' % (';'.join(css), html.escape(txt)))
     body.append(''.join(row) or ' ')
-bg = bg_default or '#000'
+# Window color: the theme background when the run painted it (most of the
+# text), otherwise black like a default terminal.
+top = bg_cover.most_common(1)
+bg = top[0][0] if top and top[0][1] > chars / 2 else '#000'
 page = f'''<!doctype html><html><head><meta charset="utf-8"><style>
 html,body{{margin:0;background:#ff00ff}}
 .wrap{{padding:0;display:inline-block}}

@@ -1036,7 +1036,7 @@ impl Renderer {
         }
         let keys: Line = [
             ("--json", "for scripts"),
-            ("--theme", "btop tty purple phosphor amber"),
+            ("--theme", "colors"),
             ("wheredns config", "save defaults"),
             ("--help", "every check"),
         ]
