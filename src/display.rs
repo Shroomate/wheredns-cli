@@ -18,6 +18,10 @@ pub enum Theme {
     Purple,
     Phosphor,
     Amber,
+    /// The terminal's own 16 colors, so light and dark terminal themes both work
+    Ansi,
+    /// No colors
+    None,
 }
 
 /// How a terminal run shows progress.
@@ -63,12 +67,15 @@ impl Theme {
             Theme::Btop => "btop",
             Theme::Phosphor => "phosphor",
             Theme::Amber => "amber",
+            Theme::Ansi => "ansi",
+            Theme::None => "none",
         }
     }
 
     // Colors match the WhereDNS web app themes.
-    fn palette(self) -> Palette {
-        match self {
+    fn palette(self) -> Option<Palette> {
+        Some(match self {
+            Theme::Ansi | Theme::None => return None,
             Theme::Tty => Palette {
                 bg: hex(0x0E1012),
                 fg: hex(0xC8CCCF),
@@ -157,7 +164,7 @@ impl Theme {
                 b: [hex(0x4A3510); 11],
                 t: [hex(0xFFD58A); 11],
             },
-        }
+        })
     }
 }
 
@@ -491,9 +498,21 @@ pub enum Slot<'a> {
     Reveal(&'a Row, f64),
 }
 
+/// How tones become escape codes.
+#[derive(Clone, Copy)]
+enum Style {
+    Plain,
+    /// SGR codes from the terminal's 16-color palette.
+    Ansi,
+    Rgb(Palette),
+}
+
+/// Group colors for the 16-color theme, in Group::ALL order.
+const ANSI_GROUP: [u8; 11] = [36, 33, 36, 35, 32, 34, 31, 34, 33, 35, 36];
+
 pub struct Renderer {
     width: Cell<usize>,
-    palette: Option<Palette>,
+    style: Style,
     theme: Theme,
     background: bool,
     live: bool,
@@ -519,7 +538,11 @@ impl Renderer {
         let color = tty && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty());
         Self {
             width: Cell::new(if tty { term_width() } else { 100 }),
-            palette: color.then(|| theme.palette()),
+            style: match (color, theme) {
+                (false, _) | (_, Theme::None) => Style::Plain,
+                (_, Theme::Ansi) => Style::Ansi,
+                _ => theme.palette().map_or(Style::Plain, Style::Rgb),
+            },
             theme,
             background,
             live: tty,
@@ -548,8 +571,14 @@ impl Renderer {
         self.width.get()
     }
 
+    fn colored(&self) -> bool {
+        !matches!(self.style, Style::Plain)
+    }
+
     fn rgb(&self, tone: Tone) -> Option<(Rgb, bool)> {
-        let p = self.palette?;
+        let Style::Rgb(p) = self.style else {
+            return None;
+        };
         Some(match tone {
             Tone::Fg => (p.fg, false),
             Tone::Dim => (p.dim, false),
@@ -566,17 +595,46 @@ impl Renderer {
         })
     }
 
-    fn paint(&self, out: &mut String, tone: Tone) {
-        let (Some(p), Some(((r, g, b), bold))) = (self.palette, self.rgb(tone)) else {
-            return;
-        };
-        let bold = if bold { ";1" } else { "" };
-        if self.background || tone == Tone::Key {
-            let (br, bgc, bb) = if tone == Tone::Key { p.border } else { p.bg };
-            write!(out, "\x1b[0;48;2;{br};{bgc};{bb};38;2;{r};{g};{b}{bold}m").unwrap();
-        } else {
-            write!(out, "\x1b[0;38;2;{r};{g};{b}{bold}m").unwrap();
+    /// SGR codes for the 16-color theme.
+    fn ansi(tone: Tone) -> String {
+        match tone {
+            Tone::Fg => "39".into(),
+            Tone::Dim => "2".into(),
+            Tone::Strong => "1".into(),
+            Tone::Accent => "1;35".into(),
+            Tone::Ok => "32".into(),
+            Tone::Warn => "33".into(),
+            Tone::Fail => "1;31".into(),
+            Tone::Info => "36".into(),
+            Tone::Title(i) => format!("1;{}", ANSI_GROUP[i]),
+            Tone::Border(i) => ANSI_GROUP.get(i).map_or("2".into(), |c| format!("2;{c}")),
+            Tone::Bar(i) => ANSI_GROUP[i].to_string(),
+            Tone::Key => "1;7;35".into(),
         }
+    }
+
+    /// Starts `tone`; `bg` paints the theme background behind it.
+    fn paint_with(&self, out: &mut String, tone: Tone, bg: bool) {
+        match self.style {
+            Style::Plain => {}
+            Style::Ansi => write!(out, "\x1b[0;{}m", Self::ansi(tone)).unwrap(),
+            Style::Rgb(p) => {
+                let Some(((r, g, b), bold)) = self.rgb(tone) else {
+                    return;
+                };
+                let bold = if bold { ";1" } else { "" };
+                if bg || tone == Tone::Key {
+                    let (br, bgc, bb) = if tone == Tone::Key { p.border } else { p.bg };
+                    write!(out, "\x1b[0;48;2;{br};{bgc};{bb};38;2;{r};{g};{b}{bold}m").unwrap();
+                } else {
+                    write!(out, "\x1b[0;38;2;{r};{g};{b}{bold}m").unwrap();
+                }
+            }
+        }
+    }
+
+    fn paint(&self, out: &mut String, tone: Tone) {
+        self.paint_with(out, tone, self.background);
     }
 
     /// Writes one line. On a terminal the row is filled to the right edge in the
@@ -587,7 +645,7 @@ impl Renderer {
             out.push_str(&s.text);
         }
         if self.live {
-            if self.palette.is_some() && self.background {
+            if matches!(self.style, Style::Rgb(_)) && self.background {
                 // Pad in the theme background through the terminal's last column
                 // (erase-line does not carry the background on every terminal).
                 // Every row is then fully overwritten when the live view redraws.
@@ -595,13 +653,13 @@ impl Renderer {
                 let used = width(line);
                 out.push_str(&" ".repeat((self.width() + 1).saturating_sub(used)));
             } else {
-                if self.palette.is_some() {
+                if self.colored() {
                     out.push_str("\x1b[0m");
                 }
                 out.push_str("\x1b[K");
             }
         }
-        if self.palette.is_some() {
+        if self.colored() {
             out.push_str("\x1b[0m");
         }
         out.push('\n');
@@ -729,17 +787,10 @@ impl Renderer {
     pub fn progress(&self, states: &[(Group, Option<bool>)], frame: usize) -> String {
         let mut out = String::new();
         for s in self.progress_line(states, frame) {
-            if let Some(((r, g, b), bold)) = self.rgb(s.tone) {
-                write!(
-                    out,
-                    "\x1b[0;38;2;{r};{g};{b}{}m",
-                    if bold { ";1" } else { "" }
-                )
-                .unwrap();
-            }
+            self.paint_with(&mut out, s.tone, false);
             out.push_str(&s.text);
         }
-        if self.palette.is_some() {
+        if self.colored() {
             out.push_str("\x1b[0m");
         }
         out
@@ -2088,5 +2139,67 @@ impl Renderer {
             sub.push_str(&format!(" · {possible} wildcard"));
         }
         sub
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn renderer(theme: Theme, background: bool) -> Renderer {
+        let mut r = Renderer::new(theme, true, background);
+        r.style = match theme {
+            Theme::None => Style::Plain,
+            Theme::Ansi => Style::Ansi,
+            t => Style::Rgb(t.palette().unwrap()),
+        };
+        r.live = true;
+        r
+    }
+
+    fn line(r: &Renderer) -> String {
+        let mut out = String::new();
+        r.emit(
+            &mut out,
+            &[
+                sp("dkim", Tone::Key),
+                sp(" pass", Tone::Ok),
+                sp(" x", Tone::Title(3)),
+            ],
+        );
+        out
+    }
+
+    #[test]
+    fn theme_none_writes_no_escapes() {
+        let out = line(&renderer(Theme::None, true));
+        assert_eq!(out, "dkim pass x\x1b[K\n");
+    }
+
+    #[test]
+    fn theme_ansi_uses_terminal_colors_only() {
+        let out = line(&renderer(Theme::Ansi, true));
+        assert!(out.contains("\x1b[0;32m pass"));
+        assert!(!out.contains("38;2") && !out.contains("48;2"));
+        assert!(out.ends_with("\x1b[0m\x1b[K\x1b[0m\n"));
+    }
+
+    #[test]
+    fn background_is_painted_only_when_enabled() {
+        let plain = line(&renderer(Theme::Btop, false));
+        // Only the key badge carries a background.
+        assert_eq!(plain.matches("48;2").count(), 1);
+        assert!(plain.ends_with("\x1b[K\x1b[0m\n"));
+        let painted = line(&renderer(Theme::Btop, true));
+        assert!(painted.matches("48;2").count() > 2);
+        assert!(!painted.contains("\x1b[K"));
+    }
+
+    #[test]
+    fn every_theme_parses() {
+        for name in ["btop", "tty", "purple", "phosphor", "amber", "ansi", "none"] {
+            let t = Theme::from_str(name, true).unwrap();
+            assert_eq!(t.name(), name);
+        }
     }
 }

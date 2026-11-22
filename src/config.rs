@@ -7,7 +7,10 @@ use clap::ValueEnum;
 use std::{fs, path::PathBuf};
 
 pub const KEYS: [(&str, &str); 4] = [
-    ("theme", "btop (default), tty, purple, phosphor, amber"),
+    (
+        "theme",
+        "btop (default), tty, purple, phosphor, amber, ansi, none",
+    ),
     (
         "checks",
         "default checks for a domain, e.g. \"where email web dns\"",
@@ -18,7 +21,7 @@ pub const KEYS: [(&str, &str); 4] = [
     ),
     (
         "background",
-        "true (paint the theme background, default) or false",
+        "false (terminal background, default) or true (paint the theme background)",
     ),
 ];
 
@@ -56,9 +59,9 @@ fn entries(text: &str) -> Vec<(String, String)> {
 
 fn validate(key: &str, value: &str) -> Result<(), String> {
     match key {
-        "theme" => Theme::from_str(value, true)
-            .map(|_| ())
-            .map_err(|_| "theme must be one of btop, tty, purple, phosphor, amber".into()),
+        "theme" => Theme::from_str(value, true).map(|_| ()).map_err(|_| {
+            "theme must be one of btop, tty, purple, phosphor, amber, ansi, none".into()
+        }),
         "animate" => Animate::from_str(value, true)
             .map(|_| ())
             .map_err(|_| "animate must be one of full, minimal, off".into()),

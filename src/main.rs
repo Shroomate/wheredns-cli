@@ -45,14 +45,14 @@ Examples:
   wheredns cloudflare.com web ports ping
   pbpaste | wheredns headers
 
-Themes: btop (default), tty, purple, phosphor, amber.
+Themes: btop (default), tty, purple, phosphor, amber, ansi (terminal colors), none.
 
 Settings (saved in ~/.config/wheredns/config):
   wheredns config                          show settings and the file path
   wheredns config set theme tty            keep a theme
   wheredns config set checks where web dns default checks for a domain
   wheredns config set animate minimal      full (live panels), minimal or off
-  wheredns config set background false     use the terminal's own background
+  wheredns config set background true      paint the theme background
 Flags beat WHEREDNS_THEME / WHEREDNS_ANIMATE, which beat the config file.
 Exit codes: 0 checks completed, 1 a check failed, 2 invalid input, 130 cancelled or deadline.";
 
@@ -608,7 +608,7 @@ async fn main() {
     let cfg = config::load();
     let theme = a.theme.or(cfg.theme).unwrap_or_default();
     let animate = a.animate.or(cfg.animate).unwrap_or_default();
-    let background = cfg.background.unwrap_or(true);
+    let background = cfg.background.unwrap_or(false);
     if a.target.as_deref() == Some("headers") {
         let raw = headers::read(io::stdin()).unwrap_or_else(|e| usage(e));
         let v = headers::parse(&raw);
