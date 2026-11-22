@@ -230,8 +230,8 @@ async fn terminal_dns_groups_queries_and_records() {
     let report = String::from_utf8(out.stdout).unwrap();
     assert!(report.starts_with("wheredns v"));
     assert!(report.contains("╭┤⁶dns "));
-    assert!(report.contains("│ A           60  192.0.2.1 "));
-    assert!(report.contains("│ AAAA         -  -- no record "));
+    assert!(report.contains("│ A           60  192.0.2.1\n"));
+    assert!(report.contains("│ AAAA         -  -- no record\n"));
     assert!(report.contains("1/1 checks ok"));
     assert!(!report.contains('\x1b'));
 }

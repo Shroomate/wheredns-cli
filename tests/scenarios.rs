@@ -85,8 +85,12 @@ fn headers_terminal_report_is_offline_and_plain_when_piped() {
     assert!(out.status.success());
     let report = String::from_utf8(out.stdout).unwrap();
     let first = report.lines().next().unwrap();
-    assert!(first.starts_with("╭┤headers email header trace├"));
-    assert!(first.ends_with(" offline ─╮"));
+    assert_eq!(first, "╭┤headers email header trace├── offline ─");
+    // Rows end with their text and stay within the 100-column report width.
+    for line in report.lines() {
+        assert_eq!(line, line.trim_end(), "trailing spaces: {line:?}");
+        assert!(line.chars().count() <= 100, "too wide: {line:?}");
+    }
     assert!(report.contains("3 hops, oldest first"));
     assert!(report.contains("total transit 7s"));
     assert!(report.contains("the header never leaves this machine"));
