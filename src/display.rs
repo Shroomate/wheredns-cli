@@ -521,8 +521,12 @@ pub struct Renderer {
     frame: Cell<usize>,
 }
 
+/// Widest the report gets. Printing narrower than a wide window leaves room to
+/// shrink it later without the terminal re-wrapping every row.
+const MAX_WIDTH: usize = 100;
+
 fn term_width() -> usize {
-    textwrap::termwidth().saturating_sub(1).max(40)
+    textwrap::termwidth().saturating_sub(1).clamp(40, MAX_WIDTH)
 }
 
 pub fn term_rows() -> usize {
@@ -637,27 +641,35 @@ impl Renderer {
         self.paint_with(out, tone, self.background);
     }
 
-    /// Writes one line. On a terminal the row is filled to the right edge in the
-    /// theme background (or erased when there is no background).
+    /// Writes one line without trailing spaces, so a row is only as wide as its
+    /// text. With a painted background the row is filled to the report width in
+    /// the theme background instead. On a terminal the rest of the row is erased.
     fn emit(&self, out: &mut String, line: &[Span]) {
-        for s in line {
+        let painted = matches!(self.style, Style::Rgb(_)) && self.background;
+        let keep = if painted {
+            line.len()
+        } else {
+            line.iter()
+                .rposition(|s| !s.text.trim_end().is_empty())
+                .map_or(0, |i| i + 1)
+        };
+        for (i, s) in line[..keep].iter().enumerate() {
             self.paint(out, s.tone);
-            out.push_str(&s.text);
+            if i + 1 == keep && !painted {
+                out.push_str(s.text.trim_end());
+            } else {
+                out.push_str(&s.text);
+            }
+        }
+        if painted {
+            self.paint(out, Tone::Fg);
+            out.push_str(&" ".repeat(self.width().saturating_sub(width(line))));
         }
         if self.live {
-            if matches!(self.style, Style::Rgb(_)) && self.background {
-                // Pad in the theme background through the terminal's last column
-                // (erase-line does not carry the background on every terminal).
-                // Every row is then fully overwritten when the live view redraws.
-                self.paint(out, Tone::Fg);
-                let used = width(line);
-                out.push_str(&" ".repeat((self.width() + 1).saturating_sub(used)));
-            } else {
-                if self.colored() {
-                    out.push_str("\x1b[0m");
-                }
-                out.push_str("\x1b[K");
+            if self.colored() {
+                out.push_str("\x1b[0m");
             }
+            out.push_str("\x1b[K");
         }
         if self.colored() {
             out.push_str("\x1b[0m");
@@ -666,7 +678,7 @@ impl Renderer {
     }
 
     fn inner(&self) -> usize {
-        self.width() - 4
+        self.width() - 2
     }
 
     fn frame(&self, out: &mut String, gi: usize, title: Line, right: Line, body: Body) {
@@ -679,27 +691,25 @@ impl Renderer {
             let sw = display_width(&s.text);
             if tw + sw > room {
                 top.push(sp(truncate(&s.text, room.saturating_sub(tw)), s.tone));
-                tw = room;
                 break;
             }
             tw += sw;
             top.push(s);
         }
-        top.push(sp("├", border));
-        let fill = w.saturating_sub(tw + width(&right) + 5);
-        top.push(sp("─".repeat(fill), border));
-        top.extend(right);
-        top.push(sp("─╮", border));
+        // Open on the right: rows end with their text, so a narrower window
+        // later only re-wraps rows that are actually long.
+        top.push(sp("├──", border));
+        if !right.is_empty() {
+            top.extend(right);
+            top.push(sp("─", border));
+        }
         self.emit(out, &top);
         for line in body.lines {
             let mut l = vec![sp("│ ", border)];
-            let used = width(&line);
             l.extend(line);
-            l.push(sp(" ".repeat(self.inner().saturating_sub(used)), Tone::Fg));
-            l.push(sp(" │", border));
             self.emit(out, &l);
         }
-        self.emit(out, &[sp(format!("╰{}╯", "─".repeat(w - 2)), border)]);
+        self.emit(out, &[sp("╰──", border)]);
         self.emit(out, &[]);
     }
 
@@ -719,9 +729,9 @@ impl Renderer {
             sp("  theme:", Tone::Dim),
             sp(self.theme.name(), Tone::Fg),
         ];
-        let gap = self.width().saturating_sub(width(&left) + width(&right));
+        let gap = 3;
         let mut line = left.clone();
-        if gap >= 2 {
+        if width(&left) + gap + width(&right) <= self.width() {
             line.push(sp(" ".repeat(gap), Tone::Fg));
             line.extend(right);
             self.emit(&mut out, &line);
@@ -2192,7 +2202,41 @@ mod tests {
         assert!(plain.ends_with("\x1b[K\x1b[0m\n"));
         let painted = line(&renderer(Theme::Btop, true));
         assert!(painted.matches("48;2").count() > 2);
-        assert!(!painted.contains("\x1b[K"));
+    }
+
+    #[test]
+    fn rows_end_with_their_text() {
+        let r = renderer(Theme::None, false);
+        let mut out = String::new();
+        r.emit(
+            &mut out,
+            &[
+                sp("A    ", Tone::Fg),
+                sp("1.2.3.4   ", Tone::Fg),
+                sp("  ", Tone::Fg),
+            ],
+        );
+        assert_eq!(out, "A    1.2.3.4\x1b[K\n");
+    }
+
+    #[test]
+    fn panels_are_open_on_the_right_and_capped() {
+        let r = renderer(Theme::None, false);
+        r.width.set(MAX_WIDTH);
+        let mut body = Body::new(r.inner());
+        body.raw(vec![sp("short", Tone::Fg)]);
+        let mut out = String::new();
+        r.frame(
+            &mut out,
+            0,
+            vec![sp("dns", Tone::Fg)],
+            vec![sp(" 7ms ", Tone::Fg)],
+            body,
+        );
+        let rows: Vec<&str> = out.lines().map(|l| l.trim_end_matches("\x1b[K")).collect();
+        assert_eq!(rows[..3], ["╭┤dns├── 7ms ─", "│ short", "╰──"]);
+        assert!(out.lines().all(|l| display_width(l) <= MAX_WIDTH + 3));
+        assert!(term_width() <= MAX_WIDTH);
     }
 
     #[test]
