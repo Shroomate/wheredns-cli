@@ -116,8 +116,9 @@ pbpaste | wheredns headers
 
 ### Themes
 
-Five built-in themes. Pick one with `--theme`, or save it with
-`wheredns config set theme NAME`.
+Five color themes, plus `ansi` and `none`. Pick one with `--theme`, or save it with
+`wheredns config set theme NAME`. `ansi` uses the terminal's own 16 colors, so
+it follows a light or dark terminal theme; `none` turns colors off.
 
 <p align="center">
   <img src="docs/images/themes.png" alt="btop, phosphor, tty, purple and amber themes" width="900">
@@ -128,7 +129,7 @@ Five built-in themes. Pick one with `--theme`, or save it with
 | Option | Default | |
 |---|---|---|
 | `--json` | | JSON output (`schema_version` 2) |
-| `--theme NAME` | `btop` | `btop`, `tty`, `purple`, `phosphor`, `amber` |
+| `--theme NAME` | `btop` | `btop`, `tty`, `purple`, `phosphor`, `amber`, `ansi`, `none` |
 | `--animate MODE` | `full` | `full` (live panels), `minimal` (progress line), `off` |
 | `--resolver IP:PORT` | `1.1.1.1:53` | Recursive resolver |
 | `--timeout SECS` | 5 | Per-operation timeout |
@@ -147,7 +148,7 @@ wheredns config                           # show settings and the file path
 wheredns config set theme tty
 wheredns config set checks where web dns  # default checks for a domain
 wheredns config set animate off
-wheredns config set background false      # use the terminal's background
+wheredns config set background true       # paint the theme background
 wheredns config unset theme
 ```
 
