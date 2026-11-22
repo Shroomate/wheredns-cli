@@ -21,8 +21,12 @@
 **Homebrew** (macOS and Linux)
 
 ```sh
+brew trust shroomate/tap
 brew install shroomate/tap/wheredns
 ```
+
+Homebrew 7 and later only load formulae from third-party taps after they are
+trusted.
 
 **Prebuilt binaries**: download, extract, and put `wheredns` on your `PATH`.
 
