@@ -1196,6 +1196,111 @@ impl Renderer {
         out
     }
 
+    /// `wheredns local`: host name, LAN address and gateway, WAN address.
+    pub fn local(&self, v: &Value, elapsed_ms: u128) -> String {
+        let mut out = String::new();
+        let mut body = Body::new(self.inner());
+        let w = 20;
+        let line = |body: &mut Body, kind: &str, k: &str, val: Line| {
+            body.row(vec![tag(kind), sp(format!(" {k}"), Tone::Dim)], w, val);
+        };
+        let missing = |what: &str| vec![sp(format!("{what} not found"), Tone::Dim)];
+        let host = v["hostname"].as_str();
+        let short = host.map(|h| h.split('.').next().unwrap_or(h));
+        match host {
+            Some(h) => {
+                let mut val = vec![sp(short.unwrap_or(h), Tone::Strong)];
+                if short != Some(h) {
+                    val.push(sp(format!("  ({h})"), Tone::Dim));
+                }
+                line(&mut body, "info", "host name", val);
+            }
+            None => line(&mut body, "warn", "host name", missing("host name")),
+        }
+        body.blank();
+        let lan = &v["lan"];
+        match lan["ip"].as_str() {
+            Some(ip) => {
+                let mut val = vec![sp(ip, Tone::Fg)];
+                if let Some(i) = lan["interface"].as_str() {
+                    val.push(sp(format!("  · {i}"), Tone::Dim));
+                }
+                line(&mut body, "info", "lan ip", val);
+            }
+            None => line(
+                &mut body,
+                "warn",
+                "lan ip",
+                vec![sp("no route to the internet", Tone::Dim)],
+            ),
+        }
+        match lan["gateway"].as_str() {
+            Some(gw) => line(&mut body, "info", "lan gateway", vec![sp(gw, Tone::Fg)]),
+            None => line(&mut body, "warn", "lan gateway", missing("default gateway")),
+        }
+        body.blank();
+        let wan = &v["wan"];
+        let sources = wan["sources"].as_array().cloned().unwrap_or_default();
+        match wan["ip"].as_str() {
+            Some(ip) => {
+                let ok = sources.iter().filter(|s| s["ip"] == ip).count();
+                let (kind, note) = if wan["agree"] == false {
+                    ("warn", "echo servers disagree".to_string())
+                } else if ok > 1 {
+                    ("pass", format!("confirmed by {ok} echo servers"))
+                } else {
+                    ("info", "one echo server answered".to_string())
+                };
+                line(
+                    &mut body,
+                    kind,
+                    "wan ip",
+                    vec![sp(ip, Tone::Strong), sp(format!("  · {note}"), Tone::Dim)],
+                );
+            }
+            None => line(
+                &mut body,
+                "fail",
+                "wan ip",
+                vec![sp(wan["error"].as_str().unwrap_or("unknown"), Tone::Fail)],
+            ),
+        }
+        if let Some(asn) = wan["asn"].as_str() {
+            let mut val = vec![sp(asn, Tone::Fg)];
+            if let Some(n) = wan["as_name"].as_str() {
+                val.push(sp(format!(" · {n}"), Tone::Fg));
+            }
+            if let Some(p) = wan["prefix"].as_str() {
+                val.push(sp(format!(" · {p}"), Tone::Dim));
+            }
+            line(&mut body, "info", "isp", val);
+        }
+        let all_agree = wan["agree"] == true && sources.iter().all(|s| s["ip"].is_string());
+        for s in sources.iter().filter(|_| !all_agree) {
+            let r = match (s["ip"].as_str(), s["error"].as_str()) {
+                (Some(ip), _) => ip.to_string(),
+                (_, Some(e)) => e.to_string(),
+                _ => continue,
+            };
+            body.note(0, &format!("{}: {r}", str_of(s, "source")));
+        }
+        self.frame(
+            &mut out,
+            0,
+            vec![
+                sp("local", Tone::Title(0)),
+                sp(format!(" {}", short.unwrap_or("this machine")), Tone::Dim),
+            ],
+            vec![
+                sp(" ", Tone::Fg),
+                sp(fmt_ms(elapsed_ms as f64), Tone::Dim),
+                sp(" ", Tone::Fg),
+            ],
+            body,
+        );
+        out
+    }
+
     /// Fills `body` for one check; returns the title's subtitle.
     fn render(&self, g: Group, d: &Value, body: &mut Body) -> String {
         let gi = g.n() - 1;

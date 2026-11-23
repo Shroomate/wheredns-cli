@@ -72,6 +72,22 @@ fn terminal_headers_show_readable_fields() {
 }
 
 #[test]
+fn local_takes_no_target_or_checks() {
+    for args in [
+        &["local", "example.com"][..],
+        &["--local", "example.com"],
+        &["--local", "local"],
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_wheredns"))
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert!(out.stdout.is_empty(), "{args:?}");
+    }
+}
+
+#[test]
 fn invalid_checks_and_record_types_are_usage_errors() {
     let bin = env!("CARGO_BIN_EXE_wheredns");
     for args in [

@@ -57,7 +57,7 @@ pub fn special_reason(ip: IpAddr) -> Option<&'static str> {
     })
 }
 
-fn reversed_labels(ip: IpAddr) -> String {
+pub(crate) fn reversed_labels(ip: IpAddr) -> String {
     dns::reverse(ip)
         .trim_end_matches(".in-addr.arpa")
         .trim_end_matches(".ip6.arpa")
@@ -1044,7 +1044,7 @@ pub async fn whois(a: &Args, t: &Target) -> CheckResult {
 
 // ── ip ─────────────────────────────────────────────────────────────────────
 
-fn cymru(v: &str) -> Vec<String> {
+pub(crate) fn cymru(v: &str) -> Vec<String> {
     v.split('|').map(|s| s.trim().to_string()).collect()
 }
 

@@ -3,6 +3,7 @@ mod config;
 mod display;
 mod dns;
 mod headers;
+mod local;
 mod rdap;
 mod util;
 mod web;
@@ -37,6 +38,8 @@ Checks (combine any; default for a domain is: where email ping whois web):
   dkim:SEL     email check using this DKIM selector, e.g. dkim:google
   all          every check
 
+  local        (instead of a target) this machine's host name, LAN IP, gateway, WAN IP
+
 Examples:
   wheredns github.com
   wheredns google.com email dkim:20230601
@@ -44,6 +47,7 @@ Examples:
   wheredns 8.8.8.8 blacklist ip
   wheredns cloudflare.com web ports ping
   pbpaste | wheredns headers
+  wheredns local
 
 Themes: btop (default), tty, purple, phosphor, amber, ansi (terminal colors), none.
 
@@ -67,6 +71,9 @@ pub struct Args {
     target: Option<String>,
     /// Checks to run, with their arguments (see below)
     checks: Vec<String>,
+    /// Show this machine's host name, LAN IP and gateway, and WAN IP (same as `wheredns local`)
+    #[arg(long)]
+    pub local: bool,
     /// Machine-readable JSON (no colors)
     #[arg(long)]
     pub json: bool,
@@ -698,6 +705,23 @@ async fn main() {
         };
         // A closed pipe (e.g. `| head`) is not an error worth a panic.
         let _ = writeln!(io::stdout().lock(), "{out}");
+        return;
+    }
+    if a.local || a.target.as_deref() == Some("local") {
+        if a.local && a.target.is_some() || !a.checks.is_empty() {
+            usage("`local` takes no target or checks");
+        }
+        let start = Instant::now();
+        let v = local::run(&a).await;
+        let out = if a.json {
+            serde_json::to_string(&v).unwrap()
+        } else {
+            display::Renderer::new(theme, false, background).local(&v, start.elapsed().as_millis())
+        };
+        let _ = writeln!(io::stdout().lock(), "{out}");
+        if v["wan"]["ip"].is_null() {
+            std::process::exit(1);
+        }
         return;
     }
     let Some(raw) = a.target.clone() else {
