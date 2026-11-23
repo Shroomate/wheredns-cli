@@ -1,10 +1,11 @@
-//! Saved preferences in `~/.config/wheredns/config` (or `$XDG_CONFIG_HOME/wheredns/config`).
+//! Saved preferences in `~/.config/wheredns/config` (or `$XDG_CONFIG_HOME/wheredns/config`;
+//! `%APPDATA%\wheredns\config` on Windows).
 //! The file is plain `key = value` lines; `wheredns config` reads and edits it.
 //! Command-line flags beat environment variables, which beat this file.
 
 use crate::display::{Animate, Theme};
 use clap::ValueEnum;
-use std::{fs, path::PathBuf};
+use std::{ffi::OsString, fs, path::PathBuf};
 
 pub const KEYS: [(&str, &str); 4] = [
     (
@@ -34,10 +35,25 @@ pub struct Config {
 }
 
 pub fn path() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+    path_from(|k| std::env::var_os(k), cfg!(windows))
+}
+
+/// `XDG_CONFIG_HOME` always wins. Otherwise Windows uses `%APPDATA%` (set in
+/// every normal shell there), and everything else `$HOME/.config`. Each
+/// platform falls back to the other's variable, then `USERPROFILE\.config`.
+fn path_from(env: impl Fn(&str) -> Option<OsString>, windows: bool) -> Option<PathBuf> {
+    let var = |k: &str| env(k).filter(|v| !v.is_empty()).map(PathBuf::from);
+    let home = || var("HOME").map(|h| h.join(".config"));
+    let appdata = || var("APPDATA");
+    let base = var("XDG_CONFIG_HOME")
+        .or_else(|| {
+            if windows {
+                appdata().or_else(home)
+            } else {
+                home().or_else(appdata)
+            }
+        })
+        .or_else(|| var("USERPROFILE").map(|h| h.join(".config")))?;
     Some(base.join("wheredns").join("config"))
 }
 
@@ -213,5 +229,38 @@ mod tests {
         assert!(validate("animate", "off").is_ok());
         assert!(validate("background", "maybe").is_err());
         assert!(validate("colour", "x").is_err());
+    }
+
+    #[test]
+    fn config_path_without_home() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| {
+                pairs
+                    .iter()
+                    .find(|(n, _)| *n == k)
+                    .map(|(_, v)| OsString::from(v))
+            }
+        };
+        let tail =
+            |p: Option<PathBuf>| p.map(|p| p.parent().unwrap().parent().unwrap().to_path_buf());
+        let win = env(&[
+            ("APPDATA", "C:/Users/u/AppData/Roaming"),
+            ("USERPROFILE", "C:/Users/u"),
+        ]);
+        assert_eq!(
+            tail(path_from(win, true)),
+            Some("C:/Users/u/AppData/Roaming".into())
+        );
+        let only_profile = env(&[("USERPROFILE", "C:/Users/u")]);
+        assert_eq!(
+            tail(path_from(only_profile, true)),
+            Some("C:/Users/u/.config".into())
+        );
+        let xdg = env(&[("XDG_CONFIG_HOME", "/x"), ("HOME", "/h"), ("APPDATA", "/a")]);
+        assert_eq!(tail(path_from(xdg, true)), Some("/x".into()));
+        assert_eq!(tail(path_from(xdg, false)), Some("/x".into()));
+        let unix = env(&[("HOME", "/h"), ("XDG_CONFIG_HOME", "")]);
+        assert_eq!(tail(path_from(unix, false)), Some("/h/.config".into()));
+        assert_eq!(path_from(env(&[]), false), None);
     }
 }
