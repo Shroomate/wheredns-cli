@@ -22,9 +22,13 @@
 
    Each archive contains `wheredns` (or `wheredns.exe`), `README.md` and `LICENSE`.
 
-4. Copy the release's `wheredns.rb` to `Formula/wheredns.rb` in
-   [Shroomate/homebrew-tap](https://github.com/Shroomate/homebrew-tap) and push.
-   Check it with:
+4. The `tap` job (`.github/workflows/tap.yml`) then copies the release's
+   `wheredns.rb` to `Formula/wheredns.rb` in
+   [Shroomate/homebrew-tap](https://github.com/Shroomate/homebrew-tap) and
+   pushes it, using the `HOMEBREW_TAP_DEPLOY_KEY` secret (a write deploy key on
+   the tap). To rerun it for an existing release, run the "Update Homebrew tap"
+   workflow from the Actions tab with the tag, or
+   `gh workflow run tap.yml -f tag=v0.1.0`. Check the result with:
 
    ```sh
    brew update
