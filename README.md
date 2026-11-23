@@ -39,6 +39,33 @@ trusted.
 
 Each release includes `SHA256SUMS`.
 
+**Windows**
+
+With [Scoop](https://scoop.sh), install from the manifest attached to each
+release:
+
+```powershell
+scoop install https://github.com/Shroomate/wheredns-cli/releases/latest/download/wheredns.json
+```
+
+Without Scoop, this PowerShell snippet downloads the latest zip, extracts it to
+`%LOCALAPPDATA%\Programs\wheredns` and adds that folder to your user `PATH`:
+
+```powershell
+$dir = "$env:LOCALAPPDATA\Programs\wheredns"
+$rel = Invoke-RestMethod https://api.github.com/repos/Shroomate/wheredns-cli/releases/latest
+$url = ($rel.assets | Where-Object name -like '*windows-msvc.zip').browser_download_url
+Invoke-WebRequest $url -OutFile "$env:TEMP\wheredns.zip"
+Expand-Archive "$env:TEMP\wheredns.zip" $dir -Force
+$path = [Environment]::GetEnvironmentVariable('Path', 'User')
+if ($path -notlike "*$dir*") {
+  [Environment]::SetEnvironmentVariable('Path', "$path;$dir", 'User')
+}
+```
+
+Open a new terminal afterwards so the updated `PATH` takes effect. To update,
+run `scoop update wheredns` or run the snippet again.
+
 **From source** (stable Rust)
 
 ```sh
