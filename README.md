@@ -6,7 +6,7 @@
   <a href="https://github.com/Shroomate/wheredns-cli/actions/workflows/ci.yml"><img src="https://github.com/Shroomate/wheredns-cli/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://github.com/Shroomate/wheredns-cli/releases/latest"><img src="https://img.shields.io/github/v/release/Shroomate/wheredns-cli?color=5fd7ff&label=release" alt="Latest release"></a>
   <img src="https://img.shields.io/badge/platforms-macOS%20%C2%B7%20Linux%20%C2%B7%20Windows-87d75f" alt="macOS, Linux, Windows">
-  <a href="docs/TESTING.md"><img src="https://img.shields.io/badge/tests-109%20offline%20cases-d7af5f" alt="109 offline test cases"></a>
+  <a href="docs/TESTING.md"><img src="https://img.shields.io/badge/tests-111%20offline%20cases-d7af5f" alt="111 offline test cases"></a>
   <a href="LICENSE"><img src="https://img.shields.io/github/license/Shroomate/wheredns-cli?color=af87d7" alt="MIT license"></a>
 </p>
 
@@ -38,6 +38,33 @@ trusted.
 | Windows x86_64 | [`x86_64-pc-windows-msvc.zip`](https://github.com/Shroomate/wheredns-cli/releases/latest) |
 
 Each release includes `SHA256SUMS`.
+
+**Windows**
+
+With [Scoop](https://scoop.sh), install from the manifest attached to each
+release:
+
+```powershell
+scoop install https://github.com/Shroomate/wheredns-cli/releases/latest/download/wheredns.json
+```
+
+Without Scoop, this PowerShell snippet downloads the latest zip, extracts it to
+`%LOCALAPPDATA%\Programs\wheredns` and adds that folder to your user `PATH`:
+
+```powershell
+$dir = "$env:LOCALAPPDATA\Programs\wheredns"
+$rel = Invoke-RestMethod https://api.github.com/repos/Shroomate/wheredns-cli/releases/latest
+$url = ($rel.assets | Where-Object name -like '*windows-msvc.zip').browser_download_url
+Invoke-WebRequest $url -OutFile "$env:TEMP\wheredns.zip"
+Expand-Archive "$env:TEMP\wheredns.zip" $dir -Force
+$path = [Environment]::GetEnvironmentVariable('Path', 'User')
+if ($path -notlike "*$dir*") {
+  [Environment]::SetEnvironmentVariable('Path', "$path;$dir", 'User')
+}
+```
+
+Open a new terminal afterwards so the updated `PATH` takes effect. To update,
+run `scoop update wheredns` or run the snippet again.
 
 **From source** (stable Rust)
 
@@ -79,6 +106,7 @@ its results arrive.
 | `dkim:SEL` | Email check using the given DKIM selector |
 | `headers` | Email header read from stdin: hop trace, delays, authentication results |
 | `all` | Every check except `headers` |
+| `local` | Instead of a target: this machine's host name, LAN IP, interface and gateway, WAN IP and ISP |
 
 ```sh
 wheredns google.com email dkim:20230601
@@ -87,6 +115,7 @@ wheredns 8.8.8.8 blacklist ip
 wheredns cloudflare.com web ports 22 443 8443
 wheredns example.com all
 pbpaste | wheredns headers
+wheredns local
 ```
 
 ## Screenshots
@@ -210,12 +239,17 @@ wheredns example.com email --json | jq '.results[0].data.findings[] | {name, kin
   are not used.
 - Private, loopback, link-local, shared, documentation and benchmark ranges are
   refused unless `--allow-private` is given.
+- `local` (or `--local`) reads the host name and default route from the OS
+  (`route` on macOS and Windows, `/proc/net/route` on Linux). The WAN IP comes
+  from two DNS queries sent straight to OpenDNS and Google's authoritative
+  servers, which answer with the address the query came from. The ISP is a Team
+  Cymru DNS lookup through the configured resolver. No geolocation service is used.
 - `headers` reads at most 64 KiB of UTF-8 from stdin and makes no network
   requests.
 
 ## Testing
 
-109 test cases, all offline. The Rust suites run in CI on Linux, Windows and
+111 test cases, all offline. The Rust suites run in CI on Linux, Windows and
 macOS (ARM64 and Intel); the two Python suites run on Linux only. DNS and HTTP
 behavior is tested against loopback fixtures, so results never depend on live
 internet data. The full list is in

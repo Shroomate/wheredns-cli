@@ -27,13 +27,13 @@ python3 tests/dns_eligibility.py         # which DNS answers count as evidence
 
 | Suite | Cases | What it covers |
 |---|---:|---|
-| Unit (`src/`) | 32 | DNS wire parsing and hostile replies, owner-bound evidence, header parsing, hostile dates, URL normalization, address policy, ping output on each platform, provider attribution at label boundaries, UTF-8-safe policy prefixes, DKIM key structure, propagation agreement rules, RDAP candidates and referral identity, HTTP header blocks, TLS error text, settings validation and config paths, theme escape output, panel width and layout |
-| CLI contract (`tests/cli.rs`) | 7 | `--help`/`--version`, usage errors, JSON schema, redirect evidence on HTTP failure, NXDOMAIN parent-zone lookup, NODATA labelling, terminal DNS layout |
+| Unit (`src/`) | 33 | DNS wire parsing and hostile replies, owner-bound evidence, header parsing, hostile dates, URL normalization, address policy, ping output on each platform, provider attribution at label boundaries, UTF-8-safe policy prefixes, DKIM key structure, propagation agreement rules, RDAP candidates and referral identity, HTTP header blocks, TLS error text, settings validation and config paths, theme escape output, panel width and layout, default-route parsing on each platform |
+| CLI contract (`tests/cli.rs`) | 8 | `--help`/`--version`, usage errors (including `local` with a target), JSON schema, redirect evidence on HTTP failure, NXDOMAIN parent-zone lookup, NODATA labelling, terminal DNS layout |
 | Scenarios (`tests/scenarios.rs`) | 14 | End-to-end runs of the binary, listed below |
 | Regressions (`tests/regressions.rs`) | 16 | End-to-end runs for the 2026-11-22 review findings, listed below |
 | Loopback regressions (`tests/loopback_regressions.py`) | 10 | REFUSED, SERVFAIL, truncated TCP, malformed PTR, unrelated owners, nonzero ping, invalid and oversized headers |
 | DNS eligibility (`tests/dns_eligibility.py`) | 30 | Which answers (by rcode, class and owner) count as evidence for each check |
-| **Total** | **109** | |
+| **Total** | **111** | |
 
 ### Scenarios
 
