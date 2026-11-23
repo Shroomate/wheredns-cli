@@ -1,8 +1,7 @@
 //! The check groups. Each runs locally and returns JSON that one panel renders.
 
 use crate::{
-    addresses, dns, limited, lookup, public, publish, rdap, util, web, Args, CheckFailure, Group,
-    Target,
+    addresses, dns, lookup, public, publish, rdap, util, web, Args, CheckFailure, Group, Target,
 };
 use futures_util::{future::join_all, stream::FuturesUnordered, StreamExt};
 use serde_json::{json, Value};
@@ -1314,12 +1313,11 @@ pub async fn ports(a: &Args, t: &Target) -> CheckResult {
         |port: u16| json!({"port": port, "svc": service(port), "kind": "pending", "ms": null});
     let all = selected.clone();
     let mut s: FuturesUnordered<_> = selected.into_iter().map(|port| async move {
-        let (r, elapsed) = limited(async {
-            let start = Instant::now();
-            let r = tokio::time::timeout(wait, tokio::net::TcpStream::connect(SocketAddr::new(ip, port))).await;
-            (r, util::ms(start.elapsed()))
-        })
-        .await;
+        // At most 10 ports, all probed at once: TCP connects to one host are
+        // not DNS load, so they stay outside the `--concurrency` limit.
+        let start = Instant::now();
+        let r = tokio::time::timeout(wait, tokio::net::TcpStream::connect(SocketAddr::new(ip, port))).await;
+        let elapsed = util::ms(start.elapsed());
         let (kind, ms, detail) = match r {
             Ok(Ok(_)) => ("open", Some(elapsed), ""),
             Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => ("closed", None, "connection refused"),
@@ -1493,10 +1491,12 @@ pub async fn ping(a: &Args, t: &Target) -> CheckResult {
             data,
         });
     }
-    // Replies arrived, but ping itself reported failure (e.g. packet loss on
-    // Linux, or an error after the first reply). The samples are kept.
+    // Replies arrived. Packet loss is a measurement, not a failure: Linux
+    // iputils exits 1 when fewer than all replies arrive by the deadline, while
+    // macOS and Windows exit 0 once any reply arrives. Other nonzero exits
+    // (e.g. 2, an error after the first reply) fail the check; samples are kept.
     match status {
-        Ok(s) if s.success() => Ok(data),
+        Ok(s) if s.success() || s.code() == Some(1) => Ok(data),
         Ok(s) => Err(CheckFailure {
             error: format!(
                 "ping exited with {s} after {received}/{PING_COUNT} replies{}",

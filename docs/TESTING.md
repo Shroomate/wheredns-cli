@@ -8,8 +8,8 @@ results don't change with DNS or registry data.
 CI runs the Rust suites (unit, CLI contract, scenarios, regressions) on Linux,
 Windows, macOS ARM64 and macOS Intel for every push and pull request. The two
 Python suites run on Linux only: their fixtures assume a Unix binary path and a
-shell-script `ping`. `ping_nonzero_exit_fails_even_with_a_reply` is Unix-only
-for the same reason.
+shell-script `ping`. `ping_error_exit_fails_even_with_a_reply` and
+`ping_packet_loss_exit_is_a_result` are Unix-only for the same reason.
 
 The counts below are what `cargo test -- --list` and the Python scripts report;
 update them when you add or remove a case.
@@ -30,10 +30,10 @@ python3 tests/dns_eligibility.py         # which DNS answers count as evidence
 | Unit (`src/`) | 32 | DNS wire parsing and hostile replies, owner-bound evidence, header parsing, hostile dates, URL normalization, address policy, ping output on each platform, provider attribution at label boundaries, UTF-8-safe policy prefixes, DKIM key structure, propagation agreement rules, RDAP candidates and referral identity, HTTP header blocks, TLS error text, settings validation and config paths, theme escape output, panel width and layout |
 | CLI contract (`tests/cli.rs`) | 7 | `--help`/`--version`, usage errors, JSON schema, redirect evidence on HTTP failure, NXDOMAIN parent-zone lookup, NODATA labelling, terminal DNS layout |
 | Scenarios (`tests/scenarios.rs`) | 14 | End-to-end runs of the binary, listed below |
-| Regressions (`tests/regressions.rs`) | 15 | End-to-end runs for the 2026-11-22 review findings, listed below |
+| Regressions (`tests/regressions.rs`) | 16 | End-to-end runs for the 2026-11-22 review findings, listed below |
 | Loopback regressions (`tests/loopback_regressions.py`) | 10 | REFUSED, SERVFAIL, truncated TCP, malformed PTR, unrelated owners, nonzero ping, invalid and oversized headers |
 | DNS eligibility (`tests/dns_eligibility.py`) | 30 | Which answers (by rcode, class and owner) count as evidence for each check |
-| **Total** | **108** | |
+| **Total** | **109** | |
 
 ### Scenarios
 
@@ -65,7 +65,8 @@ python3 tests/dns_eligibility.py         # which DNS answers count as evidence
 | `one_failed_dkim_selector_fails_the_email_check` | One SERVFAIL selector fails the check |
 | `servfail_fails_blacklist_and_subdomains_but_keeps_rows` | Failed list and name lookups fail the check and keep their rows |
 | `null_mx_skips_the_domain_blacklist` | A null MX sends no blocklist or website-address queries |
-| `ping_nonzero_exit_fails_even_with_a_reply` | A nonzero `ping` exit fails the check and keeps the samples (Unix) |
+| `ping_error_exit_fails_even_with_a_reply` | A `ping` error exit (2) fails the check and keeps the samples (Unix) |
+| `ping_packet_loss_exit_is_a_result` | Linux packet-loss exit (1) with some replies passes (Unix) |
 | `overlapping_checks_never_ask_the_same_question_twice` | `all` sends each DNS question once, even while the first answer is in flight |
 | `concurrency_bounds_in_flight_operations_per_check` | `--concurrency N` means at most N outstanding queries per check |
 | `cancelled_blacklist_keeps_answered_lists` | A deadline keeps answered lists and marks the rest pending |

@@ -85,7 +85,7 @@ pub struct Args {
     /// Whole-run deadline in seconds
     #[arg(long,default_value_t=60,value_parser=clap::value_parser!(u64).range(1..=300))]
     pub deadline: u64,
-    /// Network operations (DNS queries, TCP connects) in flight at once, per check
+    /// DNS queries in flight at once, per check
     #[arg(long,default_value_t=4,value_parser=clap::value_parser!(u8).range(1..=16))]
     pub concurrency: u8,
     /// Recursive DNS resolver (IP:port)

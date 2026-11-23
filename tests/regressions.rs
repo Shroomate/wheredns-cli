@@ -246,16 +246,18 @@ async fn null_mx_skips_the_domain_blacklist() {
     assert!(result(&v, "blacklist")["data"]["not_applicable"].is_string());
 }
 
+/// Runs `ping` against a fake `ping` that prints one reply and exits `code`.
 #[cfg(unix)]
-#[test]
-fn ping_nonzero_exit_fails_even_with_a_reply() {
+fn run_fake_ping(code: i32) -> std::process::Output {
     use std::os::unix::fs::PermissionsExt;
-    let dir = std::env::temp_dir().join(format!("wheredns-ping-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("wheredns-ping-{}-{code}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let ping = dir.join("ping");
     std::fs::write(
         &ping,
-        "#!/bin/sh\nprintf '64 bytes from 127.0.0.1: icmp_seq=1 ttl=64 time=1.0 ms\\n'\nexit 1\n",
+        format!(
+            "#!/bin/sh\nprintf '64 bytes from 127.0.0.1: icmp_seq=1 ttl=64 time=1.0 ms\\n'\nexit {code}\n"
+        ),
     )
     .unwrap();
     std::fs::set_permissions(&ping, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -270,11 +272,31 @@ fn ping_nonzero_exit_fails_even_with_a_reply() {
         .output()
         .unwrap();
     let _ = std::fs::remove_dir_all(&dir);
+    out
+}
+
+#[cfg(unix)]
+#[test]
+fn ping_error_exit_fails_even_with_a_reply() {
+    // Exit 2 is an error on Linux iputils and macOS, not packet loss.
+    let out = run_fake_ping(2);
     assert_eq!(out.status.code(), Some(1));
     let v = json(&out);
     let r = result(&v, "ping");
     assert_eq!(r["data"]["received"], 1, "samples are kept");
     assert!(r["error"].as_str().unwrap().contains("1/10 replies"));
+}
+
+#[cfg(unix)]
+#[test]
+fn ping_packet_loss_exit_is_a_result() {
+    // Linux iputils exits 1 when some, but not all, replies arrive.
+    let out = run_fake_ping(1);
+    assert_eq!(out.status.code(), Some(0));
+    let v = json(&out);
+    let r = result(&v, "ping");
+    assert_eq!(r["ok"], true);
+    assert_eq!(r["data"]["received"], 1);
 }
 
 // ── redundant work and concurrency ──────────────────────────────────────────

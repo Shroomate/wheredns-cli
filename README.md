@@ -6,7 +6,7 @@
   <a href="https://github.com/Shroomate/wheredns-cli/actions/workflows/ci.yml"><img src="https://github.com/Shroomate/wheredns-cli/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://github.com/Shroomate/wheredns-cli/releases/latest"><img src="https://img.shields.io/github/v/release/Shroomate/wheredns-cli?color=5fd7ff&label=release" alt="Latest release"></a>
   <img src="https://img.shields.io/badge/platforms-macOS%20%C2%B7%20Linux%20%C2%B7%20Windows-87d75f" alt="macOS, Linux, Windows">
-  <a href="docs/TESTING.md"><img src="https://img.shields.io/badge/tests-108%20offline%20cases-d7af5f" alt="108 offline test cases"></a>
+  <a href="docs/TESTING.md"><img src="https://img.shields.io/badge/tests-109%20offline%20cases-d7af5f" alt="109 offline test cases"></a>
   <a href="LICENSE"><img src="https://img.shields.io/github/license/Shroomate/wheredns-cli?color=af87d7" alt="MIT license"></a>
 </p>
 
@@ -138,7 +138,7 @@ it follows a light or dark terminal theme; `none` turns colors off.
 | `--resolver IP:PORT` | `1.1.1.1:53` | Recursive resolver |
 | `--timeout SECS` | 5 | Per-operation timeout |
 | `--deadline SECS` | 60 | Whole-run deadline (also applies to `headers` input) |
-| `--concurrency N` | 4 | Network operations in flight at once, per check (1–16) |
+| `--concurrency N` | 4 | DNS queries in flight at once, per check (1–16) |
 | `--allow-private` | off | Allow private, loopback and other non-public destinations and resolvers |
 
 Run `wheredns --help` for the full list.
@@ -175,7 +175,7 @@ what happened:
 | 130 | Cancelled, or the deadline was reached |
 
 NXDOMAIN and NODATA are results, not failures. SERVFAIL, REFUSED, timeouts,
-failed subqueries and a nonzero `ping` exit fail the check. A failed check
+failed subqueries and a `ping` error exit fail the check. A failed check
 still reports whatever evidence it did collect. Per check:
 
 | Check | Fails when |
@@ -185,7 +185,7 @@ still reports whatever evidence it did collect. Per check:
 | `ip` | the PTR, forward-confirmation, ASN or network registration lookup fails |
 | `where` | the NS, address or registration lookup fails. "No registration found" (RDAP 404) is a result |
 | `propagation` | any nameserver gives no usable answer, none is authoritative, or the recursive lookup fails. Non-authoritative answers are shown but not counted |
-| `ping` | no replies, or `ping` exits nonzero (samples are kept) |
+| `ping` | no replies, or `ping` exits with an error (samples are kept). Packet loss alone (Linux exit 1 with some replies) is a result |
 | `web` | the final status is not 2xx/3xx, a hop fails, or there are more than 5 redirects |
 
 The same DNS question or RDAP document is fetched once per run and shared
@@ -215,7 +215,7 @@ wheredns example.com email --json | jq '.results[0].data.findings[] | {name, kin
 
 ## Testing
 
-108 test cases, all offline. The Rust suites run in CI on Linux, Windows and
+109 test cases, all offline. The Rust suites run in CI on Linux, Windows and
 macOS (ARM64 and Intel); the two Python suites run on Linux only. DNS and HTTP
 behavior is tested against loopback fixtures, so results never depend on live
 internet data. The full list is in
