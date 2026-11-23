@@ -200,7 +200,9 @@ fn tls_error(raw: &str, host: &str) -> String {
     format!("TLS handshake failed: {raw}")
 }
 
-/// Sends the request and reads until the end of the response header block.
+/// Sends the request and returns the final response's header block. Interim
+/// 1xx responses (e.g. 103 Early Hints) are skipped; a connection that closes
+/// before the header block ends is an error, as is a block over 64 KiB.
 async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     request: &str,
@@ -210,32 +212,60 @@ async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
         .await
         .map_err(|e| format!("sending request failed: {e}"))?;
     stream.flush().await.map_err(|e| e.to_string())?;
-    let mut buf = Vec::with_capacity(4096);
+    read_head(stream).await
+}
+
+async fn read_head<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Vec<u8>, String> {
+    let mut buf: Vec<u8> = Vec::with_capacity(4096);
     let mut chunk = [0u8; 4096];
+    let mut scanned: usize = 0;
+    let mut received_any = false;
     loop {
-        if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-            buf.truncate(end + 4);
+        // Look for the end of the current header block, resuming the search
+        // a few bytes back so a delimiter split across reads is still found.
+        let from = scanned.saturating_sub(3);
+        if let Some(pos) = buf[from..].windows(4).position(|w| w == b"\r\n\r\n") {
+            let end = from + pos + 4;
+            if end > MAX_HEADER_BYTES {
+                return Err("HTTP response headers exceed 64 KiB".into());
+            }
+            if interim(&buf[..end]) {
+                buf.drain(..end);
+                scanned = 0;
+                continue;
+            }
+            buf.truncate(end);
             return Ok(buf);
         }
+        scanned = buf.len();
         if buf.len() > MAX_HEADER_BYTES {
             return Err("HTTP response headers exceed 64 KiB".into());
         }
         let n = stream.read(&mut chunk).await.map_err(|e| {
-            if buf.is_empty() {
-                format!("no HTTP response: {e}")
-            } else {
+            if received_any {
                 format!("reading response failed: {e}")
+            } else {
+                format!("no HTTP response: {e}")
             }
         })?;
         if n == 0 {
-            if buf.is_empty() {
-                return Err("server closed the connection without a response".into());
-            }
-            buf.extend_from_slice(b"\r\n\r\n");
-            continue;
+            return Err(if received_any {
+                "connection closed before the HTTP response headers ended".into()
+            } else {
+                "server closed the connection without a response".into()
+            });
         }
+        received_any = true;
         buf.extend_from_slice(&chunk[..n]);
     }
+}
+
+/// A complete 1xx header block other than 101 Switching Protocols.
+fn interim(head: &[u8]) -> bool {
+    let mut headers = [httparse::EMPTY_HEADER; 128];
+    let mut r = httparse::Response::new(&mut headers);
+    matches!(r.parse(head), Ok(httparse::Status::Complete(_)))
+        && r.code.is_some_and(|c| (100..200).contains(&c) && c != 101)
 }
 
 fn certificate(session: &rustls::ClientConnection) -> Value {
@@ -293,6 +323,64 @@ fn certificate(session: &rustls::ClientConnection) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    async fn head_from(chunks: &[&[u8]]) -> Result<Vec<u8>, String> {
+        let mut mock = tokio_test_reader(chunks);
+        read_head(&mut mock).await
+    }
+
+    /// A reader that returns the given chunks one read at a time, then EOF.
+    fn tokio_test_reader(chunks: &[&[u8]]) -> impl AsyncRead + Unpin {
+        let data: Vec<Vec<u8>> = chunks.iter().map(|c| c.to_vec()).collect();
+        Chunks(data.into_iter().collect())
+    }
+    struct Chunks(std::collections::VecDeque<Vec<u8>>);
+    impl AsyncRead for Chunks {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if let Some(mut c) = self.0.pop_front() {
+                let n = c.len().min(buf.remaining());
+                buf.put_slice(&c[..n]);
+                if n < c.len() {
+                    self.0.push_front(c.split_off(n));
+                }
+            }
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn header_blocks() {
+        // 103 Early Hints, then the final response; delimiter split across reads.
+        let head = head_from(&[
+            b"HTTP/1.1 103 Early Hints\r\nLink: </a>\r\n\r\nHTTP/1.1 200 OK\r",
+            b"\nServer: x\r\n\r",
+            b"\nbody",
+        ])
+        .await
+        .unwrap();
+        assert!(head.starts_with(b"HTTP/1.1 200 OK"));
+        assert!(head.ends_with(b"Server: x\r\n\r\n"));
+        // Closed before the header block ended.
+        assert!(head_from(&[b"HTTP/1.1 200 OK\r\nServer: x\r\n"])
+            .await
+            .is_err());
+        assert!(head_from(&[]).await.is_err());
+        // Oversized, even when the delimiter arrives in the same read.
+        let mut big = b"HTTP/1.1 200 OK\r\nX: ".to_vec();
+        big.extend(vec![b'a'; MAX_HEADER_BYTES]);
+        big.extend_from_slice(b"\r\n\r\n");
+        assert!(head_from(&[&big]).await.is_err());
+        let mut fits = b"HTTP/1.1 200 OK\r\nX: ".to_vec();
+        fits.extend(vec![b'a'; MAX_HEADER_BYTES - fits.len() - 4]);
+        fits.extend_from_slice(b"\r\n\r\n");
+        assert_eq!(head_from(&[&fits]).await.unwrap().len(), MAX_HEADER_BYTES);
+    }
+
     #[test]
     fn readable_tls_errors() {
         let raw = r#"invalid peer certificate: certificate not valid for name "1.2.3.4"; certificate is only valid for DnsName("a.com"), DnsName("b.com"), DnsName("c.com") or DnsName("d.com")"#;

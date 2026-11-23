@@ -252,13 +252,60 @@ impl Answer {
         }
     }
 
-    /// IN-class record values of the requested type, at any owner in the answer.
+    /// Follows the CNAME chain from the queried name. Returns the owner whose
+    /// records answer the question and the aliases on the way, or `None` for a
+    /// negative answer. Loops, forks and alias/data conflicts are errors.
+    fn resolve_owner(&self) -> Result<Option<(String, Vec<String>)>, String> {
+        if self.outcome != Outcome::NoError {
+            return Ok(None);
+        }
+        let canonical = |s: &str| s.trim_end_matches('.').to_ascii_lowercase();
+        let mut owner = canonical(&self.name);
+        if self.rr_type == "CNAME" {
+            return Ok(Some((owner, Vec::new())));
+        }
+        let mut chain = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..=MAX_CNAME_LINKS {
+            if !seen.insert(owner.clone()) {
+                return Err("CNAME loop".into());
+            }
+            let at_owner = |r: &&Record| r.rr_class == 1 && canonical(&r.name) == owner;
+            let aliases: Vec<_> = self
+                .records
+                .iter()
+                .filter(at_owner)
+                .filter(|r| r.rr_type == "CNAME")
+                .collect();
+            if aliases.len() > 1 {
+                return Err("ambiguous CNAME".into());
+            }
+            let Some(alias) = aliases.first() else {
+                return Ok(Some((owner, chain)));
+            };
+            if self
+                .records
+                .iter()
+                .filter(at_owner)
+                .any(|r| r.rr_type == self.rr_type)
+            {
+                return Err("CNAME conflicts with record evidence".into());
+            }
+            owner = canonical(&alias.value);
+            chain.push(owner.clone());
+        }
+        Err("CNAME chain exceeds eight links".into())
+    }
+
+    /// IN-class values of the requested type that answer the question: owned by
+    /// the queried name or by the end of its validated CNAME chain. Records at
+    /// unrelated owners, and anything in a negative answer, are not evidence
+    /// (they remain visible in `records`).
     pub fn values(&self) -> Vec<String> {
-        self.records
-            .iter()
-            .filter(|r| r.rr_class == 1 && r.rr_type == self.rr_type)
-            .map(|r| r.value.clone())
-            .collect()
+        match self.resolve_owner() {
+            Ok(Some((owner, _))) => self.values_at(&owner),
+            _ => Vec::new(),
+        }
     }
 
     /// IN-class values of the requested type owned by `owner`.
@@ -275,67 +322,31 @@ impl Answer {
             .collect()
     }
 
-    /// CNAME targets followed by the resolver.
+    /// CNAME targets followed from the queried name (validated chain only).
     pub fn chain(&self) -> Vec<String> {
-        if self.rr_type == "CNAME" {
-            return Vec::new();
+        match self.resolve_owner() {
+            Ok(Some((_, chain))) => chain,
+            _ => Vec::new(),
         }
-        self.records
-            .iter()
-            .filter(|r| r.rr_type == "CNAME")
-            .map(|r| r.value.trim_end_matches('.').to_string())
-            .collect()
     }
 
     pub fn addresses(&self) -> Result<Vec<IpAddr>, String> {
-        if self.outcome != Outcome::NoError {
+        if !matches!(self.rr_type.as_str(), "A" | "AAAA") {
             return Ok(Vec::new());
         }
-        let canonical = |s: &str| s.trim_end_matches('.').to_ascii_lowercase();
-        let mut owner = canonical(&self.name);
-        let mut seen = std::collections::HashSet::new();
-        for _ in 0..=MAX_CNAME_LINKS {
-            if !seen.insert(owner.clone()) {
-                return Err("CNAME loop".into());
-            }
-            let aliases: Vec<_> = self
-                .records
-                .iter()
-                .filter(|r| r.rr_class == 1 && canonical(&r.name) == owner && r.rr_type == "CNAME")
-                .collect();
-            if aliases.len() > 1 {
-                return Err("ambiguous CNAME".into());
-            }
-            if !aliases.is_empty()
-                && self.records.iter().any(|r| {
-                    r.rr_class == 1
-                        && canonical(&r.name) == owner
-                        && matches!(r.rr_type.as_str(), "A" | "AAAA")
-                })
-            {
-                return Err("CNAME conflicts with address evidence".into());
-            }
-            if let Some(alias) = aliases.first() {
-                owner = canonical(&alias.value);
-                continue;
-            }
-            return self
-                .records
-                .iter()
-                .filter(|r| {
-                    r.rr_class == 1 && canonical(&r.name) == owner && r.rr_type == self.rr_type
-                })
-                .filter(|r| matches!(r.rr_type.as_str(), "A" | "AAAA"))
-                .map(|r| {
-                    let ip: IpAddr = r.value.parse().map_err(|_| "invalid address RDATA")?;
-                    if (r.rr_type == "A") != ip.is_ipv4() {
-                        return Err("address family mismatch".into());
-                    }
-                    Ok(ip)
-                })
-                .collect();
-        }
-        Err("CNAME chain exceeds eight links".into())
+        let Some((owner, _)) = self.resolve_owner()? else {
+            return Ok(Vec::new());
+        };
+        self.values_at(&owner)
+            .iter()
+            .map(|v| {
+                let ip: IpAddr = v.parse().map_err(|_| "invalid address RDATA")?;
+                if (self.rr_type == "A") != ip.is_ipv4() {
+                    return Err("address family mismatch".into());
+                }
+                Ok(ip)
+            })
+            .collect()
     }
 }
 pub fn reverse(ip: IpAddr) -> String {
@@ -433,6 +444,49 @@ mod hostile_tests {
         );
         a.records.push(rec("alias.test.", "CNAME", "example.test."));
         assert!(a.addresses().is_err());
+    }
+    #[test]
+    fn evidence_is_owner_bound() {
+        let rec = |n: &str, t: &str, v: &str| Record {
+            name: n.into(),
+            rr_type: t.into(),
+            rr_class: 1,
+            ttl: 1,
+            value: v.into(),
+        };
+        let mut a = Answer {
+            name: "example.test".into(),
+            rr_type: "TXT".into(),
+            server: "fixture".into(),
+            status: "NODATA".into(),
+            outcome: Outcome::NoError,
+            authoritative: false,
+            authenticated: false,
+            records: vec![rec("unrelated.test.", "TXT", "v=spf1 -all")],
+        };
+        assert!(a.values().is_empty(), "unrelated owner");
+        a.records.push(rec("example.test.", "TXT", "mine"));
+        assert_eq!(a.values(), ["mine"]);
+        a.outcome = Outcome::NxDomain;
+        assert!(a.values().is_empty(), "negative answer");
+        a.outcome = Outcome::NoError;
+        a.records = vec![
+            rec("example.test.", "CNAME", "alias.test."),
+            rec("alias.test.", "TXT", "via alias"),
+            rec("other.test.", "TXT", "not mine"),
+        ];
+        assert_eq!(a.values(), ["via alias"]);
+        assert_eq!(a.chain(), ["alias.test"]);
+        a.records.push(rec("alias.test.", "CNAME", "example.test."));
+        assert!(a.values().is_empty(), "loop");
+        assert!(a.chain().is_empty());
+        a.rr_type = "CNAME".into();
+        a.records = vec![rec("example.test.", "CNAME", "alias.test.")];
+        assert_eq!(
+            a.values(),
+            ["alias.test."],
+            "CNAME questions are not chased"
+        );
     }
     #[test]
     fn envelope() {

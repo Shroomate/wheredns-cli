@@ -1330,6 +1330,8 @@ impl Renderer {
             vec![sp(
                 if found {
                     str_of(infra, "provider")
+                } else if infra["status"] == "not_found" {
+                    "not found"
                 } else {
                     "unavailable"
                 },
@@ -1847,6 +1849,10 @@ impl Renderer {
     }
 
     fn blacklist(&self, d: &Value, body: &mut Body) -> String {
+        if let Some(why) = d["not_applicable"].as_str() {
+            body.row(vec![tag("info")], 7, vec![sp(why, Tone::Fg)]);
+            return "not applicable".into();
+        }
         let rows = d["rows"].as_array().cloned().unwrap_or_default();
         let targets: Vec<&str> = d["targets"]
             .as_array()
@@ -2043,7 +2049,7 @@ impl Renderer {
         body.blank();
         let checked = d["checked"].as_u64().unwrap_or(0);
         let summary = if checked == 0 {
-            vec![sp("no nameserver answered", Tone::Fail)]
+            vec![sp("no nameserver gave an authoritative answer", Tone::Fail)]
         } else if d["agree"] == true {
             let mut s = vec![sp(format!("all {checked} nameservers agree"), Tone::Ok)];
             if d["providers"].as_u64().unwrap_or(0) > 1 {
@@ -2066,7 +2072,15 @@ impl Renderer {
             .flatten()
             .filter_map(Value::as_str)
             .collect();
-        if answers.is_empty() {
+        if let Some(e) = rec["error"].as_str() {
+            body.text(vec![sp(
+                format!(
+                    "{}: lookup failed ({e}); agreement with the cache unknown",
+                    str_of(rec, "resolver")
+                ),
+                Tone::Fail,
+            )]);
+        } else if answers.is_empty() {
             body.text(vec![sp(
                 format!("{}: no A record", str_of(rec, "resolver")),
                 Tone::Dim,

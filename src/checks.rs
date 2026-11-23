@@ -3,7 +3,7 @@
 use crate::{
     addresses, dns, lookup, public, publish, rdap, util, web, Args, CheckFailure, Group, Target,
 };
-use futures_util::{stream, StreamExt};
+use futures_util::{future::join_all, stream::FuturesUnordered, StreamExt};
 use serde_json::{json, Value};
 use std::{
     net::{IpAddr, SocketAddr},
@@ -77,32 +77,81 @@ async fn primary_ip(a: &Args, t: &Target) -> Result<(IpAddr, Option<String>), Ch
 
 // ── where ──────────────────────────────────────────────────────────────────
 
-const DNS_HOSTING_RULES: &[(&str, &str)] = &[
-    (".cloudflare.com", "Cloudflare"),
-    (".awsdns-", "Amazon Route 53"),
-    (".azure-dns.", "Microsoft Azure DNS"),
-    (".googledomains.com", "Google Cloud DNS"),
-    (".domaincontrol.com", "GoDaddy DNS"),
-    (".registrar-servers.com", "Namecheap DNS"),
-    (".dnsimple.com", "DNSimple"),
-    (".nsone.net", "NS1"),
-    (".digitalocean.com", "DigitalOcean DNS"),
-    (".akam.net", "Akamai Edge DNS"),
-    (".ultradns.", "UltraDNS"),
-    (".squarespacedns.com", "Squarespace DNS"),
-    (".dns-parking.com", "Hostinger DNS"),
-    (".worldnic.com", "Network Solutions DNS"),
-    (".he.net", "Hurricane Electric DNS"),
-    (".vercel-dns.com", "Vercel DNS"),
-    (".wixdns.net", "Wix DNS"),
+/// Provider nameserver domains. A nameserver matches when its name is the
+/// domain or ends in `.domain` (a DNS label boundary), never by substring.
+const DNS_HOSTING_RULES: &[(&[&str], &str)] = &[
+    (&["cloudflare.com"], "Cloudflare"),
+    (
+        &[
+            "azure-dns.com",
+            "azure-dns.net",
+            "azure-dns.org",
+            "azure-dns.info",
+        ],
+        "Microsoft Azure DNS",
+    ),
+    (&["googledomains.com"], "Google Cloud DNS"),
+    (&["domaincontrol.com"], "GoDaddy DNS"),
+    (&["registrar-servers.com"], "Namecheap DNS"),
+    (&["dnsimple.com"], "DNSimple"),
+    (&["nsone.net"], "NS1"),
+    (&["digitalocean.com"], "DigitalOcean DNS"),
+    (&["akam.net"], "Akamai Edge DNS"),
+    (
+        &[
+            "ultradns.com",
+            "ultradns.net",
+            "ultradns.org",
+            "ultradns.biz",
+            "ultradns.info",
+            "ultradns.co.uk",
+        ],
+        "UltraDNS",
+    ),
+    (&["squarespacedns.com"], "Squarespace DNS"),
+    (&["dns-parking.com"], "Hostinger DNS"),
+    (&["worldnic.com"], "Network Solutions DNS"),
+    (&["he.net"], "Hurricane Electric DNS"),
+    (&["vercel-dns.com"], "Vercel DNS"),
+    (&["wixdns.net"], "Wix DNS"),
 ];
+
+fn under(host: &str, domain: &str) -> bool {
+    host == domain
+        || host
+            .strip_suffix(domain)
+            .is_some_and(|rest| rest.ends_with('.'))
+}
+
+/// Route 53 nameservers: `ns-N.awsdns-NN.{com,net,org,co.uk}`.
+fn is_route53(host: &str) -> bool {
+    ["com", "net", "org", "co.uk"].iter().any(|tld| {
+        host.strip_suffix(tld)
+            .and_then(|r| r.strip_suffix('.'))
+            .and_then(|r| r.rsplit('.').next().zip(Some(r)))
+            .is_some_and(|(label, r)| {
+                r.contains('.')
+                    && label
+                        .strip_prefix("awsdns-")
+                        .is_some_and(|n| n.len() == 2 && n.bytes().all(|c| c.is_ascii_digit()))
+            })
+    })
+}
 
 pub fn dns_hosting_providers(nameservers: &[String]) -> Vec<Value> {
     let mut out: Vec<(String, &str)> = vec![];
     for ns in nameservers {
         let host = host_of(ns);
-        let item = match DNS_HOSTING_RULES.iter().find(|(p, _)| host.contains(p)) {
-            Some((_, name)) => (name.to_string(), "recognized"),
+        let known = if is_route53(&host) {
+            Some("Amazon Route 53")
+        } else {
+            DNS_HOSTING_RULES
+                .iter()
+                .find(|(domains, _)| domains.iter().any(|d| under(&host, d)))
+                .map(|(_, name)| *name)
+        };
+        let item = match known {
+            Some(name) => (name.to_string(), "recognized"),
             None => {
                 let labels: Vec<_> = host.split('.').collect();
                 let domain = if labels.len() > 2 {
@@ -130,18 +179,31 @@ fn ns_at(r: &Result<dns::Answer, String>, owner: &str) -> Vec<String> {
 
 pub async fn where_(a: &Args, t: &Target) -> CheckResult {
     let name = need_domain(t, "where")?;
+    // Ok(...) is evidence (including "no address"); Err(...) means a lookup failed.
     let infrastructure = async {
-        let ips = addresses(a, name).await?;
-        let ip = *ips.iter().find(|ip| ip.is_ipv4()).unwrap_or(&ips[0]);
+        let (v4, v6) = tokio::join!(
+            lookup(a, name, "A", a.resolver, true),
+            lookup(a, name, "AAAA", a.resolver, true)
+        );
+        let (v4, v6) = (v4?, v6?);
+        let ips: Vec<IpAddr> = v4.addresses()?.into_iter().chain(v6.addresses()?).collect();
+        let Some(ip) = ips.iter().find(|ip| ip.is_ipv4()).or(ips.first()).copied() else {
+            return Ok(
+                json!({"status": "not_found", "detail": format!("{name} has no A or AAAA record")}),
+            );
+        };
         if special_reason(ip).is_some() {
-            return Err(format!("{ip} is not a public address"));
+            return Ok(
+                json!({"status": "not_found", "ip": ip, "detail": format!("{ip} is not a public address")}),
+            );
         }
+        crate::permit(ip, a)?;
         let net = rdap::ip(a, ip).await?;
-        let provider = net["holder"]
-            .as_str()
-            .or(net["name"].as_str())
-            .ok_or("network registration did not publish a holder or name")?
-            .to_string();
+        let Some(provider) = net["holder"].as_str().or(net["name"].as_str()) else {
+            return Ok(
+                json!({"status": "not_found", "ip": ip, "detail": "network registration did not publish a holder or name"}),
+            );
+        };
         Ok::<_, String>(
             json!({"status": "found", "provider": provider, "ip": ip, "source": net["source"], "basis": "network-registration"}),
         )
@@ -170,13 +232,26 @@ pub async fn where_(a: &Args, t: &Target) -> CheckResult {
     } else {
         let detail = match &ns {
             Err(e) => format!("NS lookup failed: {e}"),
-            Ok(_) if registration.is_err() => {
+            Ok(_) if registration.as_ref().is_err_and(|e| !rdap::is_not_found(e)) => {
                 "could not identify the authoritative parent zone because registration lookup is unavailable".into()
             }
             Ok(_) => "no authoritative nameservers returned".into(),
         };
-        json!({"status": if ns.is_ok() && registration.is_ok() { "not_found" } else { "unavailable" }, "zone": zone, "providers": [], "nameservers": [], "detail": detail})
+        let registration_ok = registration
+            .as_ref()
+            .err()
+            .is_none_or(|e| rdap::is_not_found(e));
+        json!({"status": if ns.is_ok() && registration_ok { "not_found" } else { "unavailable" }, "zone": zone, "providers": [], "nameservers": [], "detail": detail})
     };
+    let mut problems: Vec<String> = vec![];
+    if let Err(e) = &ns {
+        problems.push(format!("NS lookup failed: {e}"));
+    }
+    if let Err(e) = &registration {
+        if !rdap::is_not_found(e) {
+            problems.push(format!("registration lookup failed: {e}"));
+        }
+    }
     let registration = match &registration {
         Ok(r) => json!({
             "status": if r["registrar"].is_string() { "found" } else { "not_found" },
@@ -185,16 +260,25 @@ pub async fn where_(a: &Args, t: &Target) -> CheckResult {
             "registrant_country": r["registrant_country"],
             "source": r["source"],
         }),
+        Err(e) if rdap::is_not_found(e) => {
+            json!({"status": "not_found", "registrar": "no registration record found", "detail": e})
+        }
         Err(e) => {
             json!({"status": "unavailable", "registrar": "registration lookup unavailable", "detail": e})
         }
     };
-    let infrastructure =
-        infrastructure.unwrap_or_else(|e| json!({"status": "unavailable", "detail": e}));
+    let infrastructure = infrastructure.unwrap_or_else(|e| {
+        problems.push(format!("infrastructure lookup failed: {e}"));
+        json!({"status": "unavailable", "detail": e})
+    });
     let data = json!({"domain": name, "dns": dns, "registration": registration, "infrastructure": infrastructure});
-    match ns {
-        Err(e) => Err(CheckFailure { error: e, data }),
-        Ok(_) => Ok(data),
+    if problems.is_empty() {
+        Ok(data)
+    } else {
+        Err(CheckFailure {
+            error: problems.join("; "),
+            data,
+        })
     }
 }
 
@@ -223,13 +307,13 @@ pub async fn dns(a: &Args, t: &Target) -> CheckResult {
         queries.push((format!("_submission._tcp.{name}"), "SRV".into()));
         queries.push((format!("_443._tcp.{name}"), "TLSA".into()));
     }
-    let results: Vec<_> = stream::iter(
+    // Every query is issued at once; `lookup` holds each to the per-check
+    // concurrency limit, so a slow early answer never stalls later ones.
+    let results: Vec<_> = join_all(
         queries
             .iter()
             .map(|(owner, ty)| lookup(a, owner, ty, a.resolver, true)),
     )
-    .buffered(a.concurrency as usize)
-    .collect()
     .await;
     let mut errors = vec![];
     let rows: Vec<Value> = results
@@ -299,8 +383,84 @@ fn dmarc_tag(rec: &str, key: &str) -> Option<String> {
     })
 }
 
+/// ASCII case-insensitive prefix test that is safe for any UTF-8 input.
 fn starts_ci(s: &str, prefix: &str) -> bool {
-    s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix)
+    s.as_bytes()
+        .get(..prefix.len())
+        .is_some_and(|b| b.eq_ignore_ascii_case(prefix.as_bytes()))
+}
+
+/// True when a tag-value record (DMARC, MTA-STS, TLS-RPT, BIMI, DKIM) starts
+/// with exactly `v=<version>`, so `v=DMARC10` is not a DMARC1 record.
+fn has_version(rec: &str, version: &str) -> bool {
+    rec.split(';')
+        .next()
+        .and_then(|t| t.split_once('='))
+        .is_some_and(|(k, v)| {
+            k.trim().eq_ignore_ascii_case("v") && v.trim().eq_ignore_ascii_case(version)
+        })
+}
+
+/// Tag-value list (RFC 6376 §3.2). None when a tag is malformed or repeated.
+fn tag_list(rec: &str) -> Option<Vec<(String, String)>> {
+    let mut out: Vec<(String, String)> = vec![];
+    for part in rec.split(';').filter(|p| !p.trim().is_empty()) {
+        let (k, v) = part.split_once('=')?;
+        let k = k.trim().to_ascii_lowercase();
+        let valid = !k.is_empty() && k.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_');
+        if !valid || out.iter().any(|(n, _)| *n == k) {
+            return None;
+        }
+        out.push((k, v.trim().to_string()));
+    }
+    Some(out)
+}
+
+fn is_base64(s: &str) -> bool {
+    let body = s.trim_end_matches('=');
+    !body.is_empty()
+        && s.len().is_multiple_of(4)
+        && s.len() - body.len() <= 2
+        && body
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'+' || c == b'/')
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DkimKey {
+    Malformed(&'static str),
+    Revoked,
+    Published,
+}
+
+/// Classifies one TXT value at `<selector>._domainkey`. None means it is not a
+/// DKIM key record at all. This checks structure only, never signatures.
+pub fn dkim_key(rec: &str) -> Option<DkimKey> {
+    let lower = rec.to_ascii_lowercase();
+    let Some(tags) = tag_list(rec) else {
+        let looks_dkim = has_version(rec, "DKIM1") || lower.contains("p=");
+        return looks_dkim.then_some(DkimKey::Malformed("malformed or repeated tags"));
+    };
+    let get = |k: &str| tags.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+    let dkim1 = get("v").is_some_and(|v| v.eq_ignore_ascii_case("DKIM1"));
+    match tags.iter().position(|(n, _)| n == "v") {
+        Some(0) if dkim1 => {}
+        // Some other record type (e.g. SPF) that happens to sit at the selector.
+        _ if !dkim1 && get("p").is_none() => return None,
+        Some(_) => return Some(DkimKey::Malformed("v= must be first and exactly DKIM1")),
+        None => {}
+    }
+    let Some(p) = get("p") else {
+        return Some(DkimKey::Malformed("no p= public key tag"));
+    };
+    let key: String = p.split_whitespace().collect();
+    Some(if key.is_empty() {
+        DkimKey::Revoked
+    } else if is_base64(&key) {
+        DkimKey::Published
+    } else {
+        DkimKey::Malformed("p= is not valid base64")
+    })
 }
 
 pub async fn email(a: &Args, t: &Target) -> CheckResult {
@@ -321,21 +481,18 @@ pub async fn email(a: &Args, t: &Target) -> CheckResult {
     for s in &selectors {
         q.push((format!("{s}._domainkey.{d}"), "TXT"));
     }
-    let r: Vec<_> = stream::iter(q.iter().map(|(n, ty)| lookup(a, n, ty, a.resolver, true)))
-        .buffered(a.concurrency as usize)
-        .collect()
-        .await;
+    let r: Vec<_> = join_all(q.iter().map(|(n, ty)| lookup(a, n, ty, a.resolver, true))).await;
     let (mx, spf, mta_sts, tls_rpt, bimi, dmarc) = (&r[0], &r[1], &r[2], &r[3], &r[4], &r[5]);
     let dkims: Vec<(&String, &Result<dns::Answer, String>)> =
         selectors.iter().zip(&r[6..]).collect();
     let mut out = vec![];
     if kind_of(mx) == "nxdomain" && kind_of(spf) == "nxdomain" {
-        let data = json!({"domain": d, "dkim_selectors": selectors, "nxdomain": true,
-            "findings": [finding("DNS", "fail", format!("{d} does not exist (NXDOMAIN)"), "no mail records can exist for a name that is not in DNS")]});
-        return Err(CheckFailure {
-            error: format!("{d} does not exist (NXDOMAIN)"),
-            data,
-        });
+        // NXDOMAIN is a result (README scripting contract), not a lookup failure.
+        return Ok(
+            json!({"domain": d, "dkim_selectors": selectors, "nxdomain": true, "mx": [],
+            "findings": [finding("DNS", "fail", format!("{d} does not exist (NXDOMAIN)"), "no mail records can exist for a name that is not in DNS")],
+            "scope": "DNS policy evidence; no delivery or signature validation"}),
+        );
     }
 
     // MX
@@ -348,6 +505,7 @@ pub async fn email(a: &Args, t: &Target) -> CheckResult {
         .collect();
     mx_rows.sort();
     let mut mx_hosts = vec![];
+    let mut errors: Vec<String> = vec![];
     if let Err(e) = mx {
         out.push(finding("MX", "error", "lookup failed", e.clone()));
     } else if mx_rows.len() == 1 && mx_rows[0].1.is_empty() && mx_rows[0].0 == 0 {
@@ -365,29 +523,55 @@ pub async fn email(a: &Args, t: &Target) -> CheckResult {
             "mail falls back to the A record, or bounces",
         ));
     } else {
-        for (pref, host) in mx_rows.iter().take(4) {
+        let resolved = join_all(mx_rows.iter().take(4).map(|(pref, host)| async move {
             let (a4, a6) = tokio::join!(
                 lookup(a, host, "A", a.resolver, true),
                 lookup(a, host, "AAAA", a.resolver, true)
             );
+            let failed: Vec<String> = [&a4, &a6]
+                .into_iter()
+                .filter_map(|r| r.as_ref().err().cloned())
+                .collect();
             let ips: Vec<String> = values(&a4).into_iter().chain(values(&a6)).collect();
-            mx_hosts.push(json!({"pref": pref, "host": host, "ips": ips}));
-        }
+            json!({"pref": pref, "host": host, "ips": ips, "error": failed.first()})
+        }))
+        .await;
+        mx_hosts = resolved;
+        let unresolved: Vec<&str> = mx_hosts
+            .iter()
+            .filter(|m| m["error"].is_string())
+            .filter_map(|m| m["host"].as_str())
+            .collect();
         let dangling: Vec<&str> = mx_hosts
             .iter()
+            .filter(|m| m["error"].is_null())
             .filter(|m| m["ips"].as_array().is_some_and(|i| i.is_empty()))
             .filter_map(|m| m["host"].as_str())
             .collect();
+        if !unresolved.is_empty() {
+            errors.push(format!(
+                "MX host address lookup failed for {}",
+                unresolved.join(", ")
+            ));
+        }
         let n = mx_rows.len();
         out.push(finding(
             "MX",
-            if dangling.is_empty() { "pass" } else { "warn" },
+            if !unresolved.is_empty() {
+                "error"
+            } else if dangling.is_empty() {
+                "pass"
+            } else {
+                "warn"
+            },
             mx_rows
                 .iter()
                 .map(|(p, h)| format!("{p} {h}"))
                 .collect::<Vec<_>>()
                 .join("  "),
-            if dangling.is_empty() {
+            if !unresolved.is_empty() {
+                format!("address lookup failed for {}", unresolved.join(", "))
+            } else if dangling.is_empty() {
                 format!(
                     "{n} host{} · all resolve{}",
                     if n > 1 { "s" } else { "" },
@@ -402,7 +586,11 @@ pub async fn email(a: &Args, t: &Target) -> CheckResult {
     // SPF
     let spf_recs: Vec<String> = values(spf)
         .into_iter()
-        .filter(|v| starts_ci(v, "v=spf1") && v[6..].chars().next().is_none_or(char::is_whitespace))
+        .filter(|v| {
+            starts_ci(v, "v=spf1")
+                && v.get(6..)
+                    .is_some_and(|r| r.chars().next().is_none_or(char::is_whitespace))
+        })
         .collect();
     if failed(spf) {
         out.push(finding(
@@ -474,7 +662,7 @@ pub async fn email(a: &Args, t: &Target) -> CheckResult {
     // DMARC: exact record lint, not RFC 9989 tree-walk policy.
     let dmarc_recs: Vec<String> = values(dmarc)
         .into_iter()
-        .filter(|v| starts_ci(v, "v=DMARC1"))
+        .filter(|v| has_version(v, "DMARC1"))
         .collect();
     if failed(dmarc) {
         out.push(finding("DMARC", "error", "lookup failed", ""));
@@ -515,59 +703,78 @@ pub async fn email(a: &Args, t: &Target) -> CheckResult {
         out.push(finding("DMARC", kind, rec.clone(), notes.join(" · ")));
     }
 
-    // DKIM
-    let has_key = |v: &String| {
-        let l = v.to_ascii_lowercase();
-        l.contains("v=dkim1") || l.split(';').any(|p| p.trim_start().starts_with("p="))
-    };
-    let revoked = |v: &String| {
-        v.split(';')
-            .any(|p| p.trim().eq_ignore_ascii_case("p=") || p.trim().eq_ignore_ascii_case("p ="))
-    };
-    let found: Vec<_> = dkims
+    // DKIM: key record structure only; signatures are never validated here.
+    let classified: Vec<(&str, Option<DkimKey>)> = dkims
         .iter()
-        .filter(|(_, r)| values(r).iter().any(has_key))
+        .map(|(sel, r)| {
+            (
+                sel.as_str(),
+                values(r).iter().filter_map(|v| dkim_key(v)).max(),
+            )
+        })
+        .collect();
+    let with = |want: fn(&DkimKey) -> bool| -> Vec<&str> {
+        classified
+            .iter()
+            .filter(|(_, k)| k.as_ref().is_some_and(want))
+            .map(|(s, _)| *s)
+            .collect()
+    };
+    let published = with(|k| *k == DkimKey::Published);
+    let revoked = with(|k| *k == DkimKey::Revoked);
+    let malformed: Vec<String> = classified
+        .iter()
+        .filter_map(|(s, k)| match k {
+            Some(DkimKey::Malformed(why)) => Some(format!("{s} ({why})")),
+            _ => None,
+        })
         .collect();
     let dkim_errors: Vec<&str> = dkims
         .iter()
         .filter(|(_, r)| failed(r))
         .map(|(s, _)| s.as_str())
         .collect();
-    if !found.is_empty() {
-        let dead: Vec<&str> = found
+    let mut extra = vec![];
+    if !revoked.is_empty() {
+        extra.push(format!("revoked: {}", revoked.join(", ")));
+    }
+    if !malformed.is_empty() {
+        extra.push(format!("malformed: {}", malformed.join(", ")));
+    }
+    if !dkim_errors.is_empty() {
+        extra.push(format!("lookup failed: {}", dkim_errors.join(", ")));
+        errors.push(format!("DKIM lookup failed for {}", dkim_errors.join(", ")));
+    }
+    let extra = extra.iter().map(|e| format!(" · {e}")).collect::<String>();
+    if !published.is_empty() {
+        out.push(finding(
+            "DKIM",
+            "pass",
+            published.join(", "),
+            format!(
+                "key record published for {} selector{}{extra}",
+                published.len(),
+                if published.len() > 1 { "s" } else { "" },
+            ),
+        ));
+    } else if !revoked.is_empty() || !malformed.is_empty() {
+        let names: Vec<&str> = classified
             .iter()
-            .filter(|(_, r)| values(r).iter().any(revoked))
-            .map(|(s, _)| s.as_str())
+            .filter(|(_, k)| k.is_some())
+            .map(|(s, _)| *s)
             .collect();
         out.push(finding(
             "DKIM",
-            if dead.len() == found.len() {
-                "warn"
-            } else {
-                "pass"
-            },
-            found
-                .iter()
-                .map(|(s, _)| s.as_str())
-                .collect::<Vec<_>>()
-                .join(", "),
-            format!(
-                "key found for {} selector{}{}",
-                found.len(),
-                if found.len() > 1 { "s" } else { "" },
-                if dead.is_empty() {
-                    String::new()
-                } else {
-                    format!(" · revoked: {}", dead.join(", "))
-                }
-            ),
+            "warn",
+            names.join(", "),
+            format!("no usable key{extra}"),
         ));
-    } else if !dkim_errors.is_empty() && dkim_errors.len() == dkims.len() {
+    } else if !dkim_errors.is_empty() {
         out.push(finding(
             "DKIM",
             "error",
             "lookup failed",
-            "selector lookups failed",
+            format!("selector lookups failed: {}", dkim_errors.join(", ")),
         ));
     } else {
         out.push(finding(
@@ -580,7 +787,7 @@ pub async fn email(a: &Args, t: &Target) -> CheckResult {
 
     let sts = values(mta_sts)
         .into_iter()
-        .find(|v| starts_ci(v, "v=STSv1"));
+        .find(|v| has_version(v, "STSv1"));
     out.push(match (failed(mta_sts), sts) {
         (true, _) => finding(
             "MTA-STS",
@@ -603,7 +810,7 @@ pub async fn email(a: &Args, t: &Target) -> CheckResult {
     });
     let rpt = values(tls_rpt)
         .into_iter()
-        .find(|v| starts_ci(v, "v=TLSRPTv1"));
+        .find(|v| has_version(v, "TLSRPTv1"));
     out.push(match (failed(tls_rpt), rpt) {
         (true, _) => finding(
             "TLS-RPT",
@@ -619,7 +826,7 @@ pub async fn email(a: &Args, t: &Target) -> CheckResult {
         ),
         (_, Some(v)) => finding("TLS-RPT", "pass", v, "TLS failure reports on"),
     });
-    let b = values(bimi).into_iter().find(|v| starts_ci(v, "v=BIMI1"));
+    let b = values(bimi).into_iter().find(|v| has_version(v, "BIMI1"));
     out.push(match (failed(bimi), b) {
         (true, _) => finding(
             "BIMI",
@@ -636,11 +843,12 @@ pub async fn email(a: &Args, t: &Target) -> CheckResult {
         (_, Some(v)) => finding("BIMI", "pass", v, "brand logo published"),
     });
 
-    let errors: Vec<String> = out
-        .iter()
-        .filter(|f| f["kind"] == "error")
-        .map(|f| format!("{} lookup failed", f["name"].as_str().unwrap_or_default()))
-        .collect();
+    for f in out.iter().filter(|f| f["kind"] == "error") {
+        let name = f["name"].as_str().unwrap_or_default();
+        if !errors.iter().any(|e| e.starts_with(name)) {
+            errors.push(format!("{name} lookup failed"));
+        }
+    }
     let data = json!({"domain": d, "dkim_selectors": selectors, "findings": out, "mx": mx_hosts,
         "scope": "DNS policy evidence; no delivery or signature validation"});
     if errors.is_empty() {
@@ -675,32 +883,48 @@ pub const DNSBLS: &[(&str, &str)] = &[
 pub async fn blacklist(a: &Args, t: &Target) -> CheckResult {
     let mut ips: Vec<(IpAddr, String)> = vec![];
     if let Some(ip) = t.ip {
-        if special_reason(ip).is_some() {
-            return Err(format!(
-                "{ip} is {}: public blocklists skipped",
-                special_reason(ip).unwrap()
-            )
-            .into());
+        if let Some(why) = special_reason(ip) {
+            return Err(format!("{ip} is {why}: public blocklists skipped").into());
         }
         ips.push((ip, ip.to_string()));
     } else {
         let mx = lookup(a, &t.host, "MX", a.resolver, true).await;
-        let hosts: Vec<String> = values(&mx)
+        let mx = mx.map_err(|e| format!("MX lookup failed: {e}"))?;
+        let rows: Vec<(u16, String)> = mx
+            .values()
             .iter()
-            .filter_map(|v| v.split_whitespace().nth(1).map(host_of))
-            .filter(|h| !h.is_empty())
-            .take(2)
+            .filter_map(|v| {
+                let (pref, host) = v.split_once(' ')?;
+                Some((pref.parse().ok()?, host_of(host)))
+            })
             .collect();
-        let hosts = if hosts.is_empty() {
-            vec![t.host.clone()]
-        } else {
-            hosts
-        };
+        if rows.len() == 1 && rows[0] == (0, String::new()) {
+            // RFC 7505 null MX: there is no mail server to look up.
+            return Ok(json!({
+                "targets": [], "listed": 0, "answered": 0, "total": 0, "rows": [],
+                "not_applicable": format!("{} publishes a null MX (accepts no mail); check an IP address directly instead", t.host),
+            }));
+        }
+        let mut sorted = rows;
+        sorted.sort();
+        let mut hosts: Vec<String> = sorted
+            .into_iter()
+            .map(|(_, h)| h)
+            .filter(|h| !h.is_empty())
+            .collect();
+        hosts.dedup();
+        hosts.truncate(2);
+        // No MX at all: mail is delivered to the domain's own address (RFC 5321 §5.1).
+        if hosts.is_empty() {
+            hosts.push(t.host.clone());
+        }
         for h in hosts {
-            let r = lookup(a, &h, "A", a.resolver, true).await;
+            let r = lookup(a, &h, "A", a.resolver, true)
+                .await
+                .map_err(|e| format!("address lookup for {h} failed: {e}"))?;
             if let Some(ip) = r
+                .addresses()
                 .ok()
-                .and_then(|r| r.addresses().ok())
                 .and_then(|v| v.into_iter().find(|ip| special_reason(*ip).is_none()))
             {
                 ips.push((ip, format!("{h} → {ip}")));
@@ -721,38 +945,40 @@ pub async fn blacklist(a: &Args, t: &Target) -> CheckResult {
     let targets: Vec<&String> = v4.iter().map(|(_, l)| l).collect();
     let total = queries.len();
     let order: Vec<(IpAddr, &str)> = queries.iter().map(|(ip, n, _)| (*ip, *n)).collect();
-    let mut s = stream::iter(queries.into_iter().map(|(ip, name, zone)| async move {
-        let owner = format!("{}.{zone}", reversed_labels(ip));
-        let r = lookup(a, &owner, "A", a.resolver, true).await;
-        let (kind, detail) = match &r {
-            Ok(ans) if ans.kind() != "answered" => ("clean", String::new()),
-            Ok(ans) => {
-                let codes = ans.values();
-                if codes
-                    .iter()
-                    .any(|c| c.starts_with("127.255.255.") || c == "127.0.0.1")
-                {
-                    ("error", format!("list refused the query ({})", codes[0]))
-                } else if !codes.is_empty() && codes.iter().all(|c| c.starts_with("127.")) {
-                    let reason = lookup(a, &owner, "TXT", a.resolver, true).await;
-                    let text = values(&reason)
-                        .into_iter()
-                        .next()
-                        .map(|s| s.chars().take(200).collect());
-                    ("listed", text.unwrap_or_else(|| codes.join(", ")))
-                } else {
-                    (
-                        "error",
-                        "unexpected list response; listing status unavailable".into(),
-                    )
+    let mut s: FuturesUnordered<_> = queries
+        .into_iter()
+        .map(|(ip, name, zone)| async move {
+            let owner = format!("{}.{zone}", reversed_labels(ip));
+            let r = lookup(a, &owner, "A", a.resolver, true).await;
+            let (kind, detail) = match &r {
+                Ok(ans) if ans.kind() != "answered" => ("clean", String::new()),
+                Ok(ans) => {
+                    let codes = ans.values();
+                    if codes
+                        .iter()
+                        .any(|c| c.starts_with("127.255.255.") || c == "127.0.0.1")
+                    {
+                        ("error", format!("list refused the query ({})", codes[0]))
+                    } else if !codes.is_empty() && codes.iter().all(|c| c.starts_with("127.")) {
+                        let reason = lookup(a, &owner, "TXT", a.resolver, true).await;
+                        let text = values(&reason)
+                            .into_iter()
+                            .next()
+                            .map(|s| s.chars().take(200).collect());
+                        ("listed", text.unwrap_or_else(|| codes.join(", ")))
+                    } else {
+                        (
+                            "error",
+                            "unexpected list response; listing status unavailable".into(),
+                        )
+                    }
                 }
-            }
-            Err(e) if e.contains("timeout") => ("timeout", e.clone()),
-            Err(e) => ("error", e.clone()),
-        };
-        json!({"ip": ip, "name": name, "zone": zone, "kind": kind, "detail": detail})
-    }))
-    .buffer_unordered(a.concurrency as usize * 2);
+                Err(e) if e.contains("timeout") => ("timeout", e.clone()),
+                Err(e) => ("error", e.clone()),
+            };
+            json!({"ip": ip, "name": name, "zone": zone, "kind": kind, "detail": detail})
+        })
+        .collect();
     let mut done: Vec<Value> = vec![];
     let ordered = |done: &[Value], fill: bool| -> Vec<Value> {
         order
@@ -783,14 +1009,25 @@ pub async fn blacklist(a: &Args, t: &Target) -> CheckResult {
             .filter(|r| k.iter().any(|k| r["kind"] == *k))
             .count()
     };
-    Ok(json!({
+    let unanswered = count(&["error", "timeout"]);
+    let data = json!({
         "targets": targets,
         "listed": count(&["listed"]),
         "answered": count(&["listed", "clean"]),
         "total": rows.len(),
         "rows": rows,
         "skipped": ["Spamhaus (requires a key; public resolvers are refused)"],
-    }))
+    });
+    if unanswered > 0 {
+        return Err(CheckFailure {
+            error: format!(
+                "{unanswered} of {} blocklist lookups failed; listing status for those lists is unknown",
+                data["total"]
+            ),
+            data,
+        });
+    }
+    Ok(data)
 }
 
 // ── whois ──────────────────────────────────────────────────────────────────
@@ -833,23 +1070,31 @@ pub async fn ip(a: &Args, t: &Target) -> CheckResult {
         rows.push(json!({"k": "ptr", "v": "no reverse DNS", "kind": "warn"}));
     }
     let mut confirmed_any = false;
-    for h in ptrs.iter().take(3) {
-        let fwd = lookup(
-            a,
-            h,
-            if ip.is_ipv4() { "A" } else { "AAAA" },
-            a.resolver,
-            true,
-        )
-        .await;
+    let mut errors: Vec<String> = vec![];
+    let family = if ip.is_ipv4() { "A" } else { "AAAA" };
+    let forwards = join_all(
+        ptrs.iter()
+            .take(3)
+            .map(|h| lookup(a, h, family, a.resolver, true)),
+    )
+    .await;
+    for (h, fwd) in ptrs.iter().zip(forwards) {
         let confirmed = fwd
             .as_ref()
             .ok()
             .and_then(|r| r.addresses().ok())
             .is_some_and(|v| v.contains(&ip));
         confirmed_any |= confirmed;
+        let note = match &fwd {
+            _ if confirmed => "forward-confirmed".to_string(),
+            Err(e) => {
+                errors.push(format!("forward lookup for {h} failed: {e}"));
+                format!("forward lookup failed: {e}")
+            }
+            Ok(_) => "does not resolve back to this IP".to_string(),
+        };
         rows.push(json!({"k": "ptr", "v": h, "kind": if confirmed { "pass" } else if fwd.is_err() { "error" } else { "warn" },
-            "note": if confirmed { "forward-confirmed" } else { "does not resolve back to this IP" }}));
+            "note": note}));
     }
     if special.is_none() {
         let zone = if ip.is_ipv4() {
@@ -862,15 +1107,21 @@ pub async fn ip(a: &Args, t: &Target) -> CheckResult {
             lookup(a, &origin_name, "TXT", a.resolver, true),
             rdap::ip(a, ip)
         );
+        if let Err(e) = &origin {
+            errors.push(format!("ASN lookup failed: {e}"));
+        }
         match values(&origin).first().map(|v| cymru(v)) {
             Some(f) if f.len() >= 4 && f[0].split(' ').next().is_some_and(|n| n.parse::<u32>().is_ok()) => {
                 let asn = f[0].split(' ').next().unwrap_or_default().to_string();
                 let name = lookup(a, &format!("AS{asn}.asn.cymru.com"), "TXT", a.resolver, true).await;
+                if let Err(e) = &name {
+                    errors.push(format!("AS name lookup failed: {e}"));
+                }
                 let as_name = values(&name).first().and_then(|v| cymru(v).get(4).cloned()).unwrap_or_default();
                 rows.push(json!({"k": "asn", "v": if as_name.is_empty() { format!("AS{asn}") } else { format!("AS{asn} · {as_name}") }, "kind": "info"}));
                 rows.push(json!({"k": "bgp prefix", "v": format!("{} · {} · {}", f[1], f[2], f[3]), "kind": "info"}));
             }
-            _ => rows.push(json!({"k": "asn", "v": "ASN information unavailable from Team Cymru", "kind": "info"})),
+            _ => rows.push(json!({"k": "asn", "v": "ASN information unavailable from Team Cymru", "kind": if origin.is_err() { "error" } else { "info" }})),
         }
         match rir {
             Ok(r) => {
@@ -894,15 +1145,31 @@ pub async fn ip(a: &Args, t: &Target) -> CheckResult {
                     rows.push(json!({"k": "abuse", "v": abuse, "kind": "info"}));
                 }
             }
-            Err(e) => rows.push(json!({"k": "network", "v": e, "kind": "error"})),
+            Err(e) => {
+                errors.push(format!("network registration unavailable: {e}"));
+                rows.push(json!({"k": "network", "v": e, "kind": "error"}))
+            }
         }
     }
-    Ok(
-        json!({"ip": ip, "from": from, "public": special.is_none(), "rows": rows, "ptr_confirmed": confirmed_any}),
-    )
+    let data = json!({"ip": ip, "from": from, "public": special.is_none(), "rows": rows, "ptr_confirmed": confirmed_any});
+    if errors.is_empty() {
+        Ok(data)
+    } else {
+        Err(CheckFailure {
+            error: errors.join("; "),
+            data,
+        })
+    }
 }
 
 // ── web ────────────────────────────────────────────────────────────────────
+
+const MAX_REDIRECTS: usize = 5;
+
+/// Statuses that carry a Location to follow (RFC 9110 §15.4). 300 and 304 do not.
+fn is_redirect(status: u16) -> bool {
+    matches!(status, 301 | 302 | 303 | 307 | 308)
+}
 
 fn permitted_redirect(u: &reqwest::Url) -> bool {
     ["http", "https"].contains(&u.scheme()) && u.username().is_empty() && u.password().is_none()
@@ -914,9 +1181,10 @@ pub async fn web(a: &Args, t: &Target) -> CheckResult {
     let mut hops: Vec<Value> = vec![];
     let mut error = None;
     let mut seen = vec![];
-    for i in 0..6 {
-        if i == 5 {
-            error = Some("more than 5 redirects".to_string());
+    // The first request plus up to MAX_REDIRECTS followed redirects.
+    for i in 0..=MAX_REDIRECTS + 1 {
+        if i > MAX_REDIRECTS {
+            error = Some(format!("more than {MAX_REDIRECTS} redirects"));
             break;
         }
         seen.push(url.to_string());
@@ -927,7 +1195,7 @@ pub async fn web(a: &Args, t: &Target) -> CheckResult {
             }
             Ok(h) => {
                 hops.push(h.value);
-                if (300..400).contains(&h.status) {
+                if is_redirect(h.status) {
                     let Some(loc) = h.location else {
                         error = Some("redirect without location".into());
                         break;
@@ -963,7 +1231,7 @@ pub async fn web(a: &Args, t: &Target) -> CheckResult {
             plain.set_query(None);
             if let Ok(h) = web::hop(a, &plain).await {
                 http_upgrade = json!(
-                    (300..400).contains(&h.status)
+                    is_redirect(h.status)
                         && h.location
                             .and_then(|l| plain.join(&l).ok())
                             .is_some_and(|u| u.scheme() == "https")
@@ -1044,7 +1312,9 @@ pub async fn ports(a: &Args, t: &Target) -> CheckResult {
     let placeholder =
         |port: u16| json!({"port": port, "svc": service(port), "kind": "pending", "ms": null});
     let all = selected.clone();
-    let mut s = stream::iter(selected.into_iter().map(|port| async move {
+    let mut s: FuturesUnordered<_> = selected.into_iter().map(|port| async move {
+        // At most 10 ports, all probed at once: TCP connects to one host are
+        // not DNS load, so they stay outside the `--concurrency` limit.
         let start = Instant::now();
         let r = tokio::time::timeout(wait, tokio::net::TcpStream::connect(SocketAddr::new(ip, port))).await;
         let elapsed = util::ms(start.elapsed());
@@ -1055,8 +1325,7 @@ pub async fn ports(a: &Args, t: &Target) -> CheckResult {
             Err(_) => ("timeout", None, "no answer before timeout"),
         };
         json!({"port": port, "svc": service(port), "kind": kind, "ms": ms, "detail": detail, "open": kind == "open"})
-    }))
-    .buffer_unordered(16);
+    }).collect();
     let mut done: Vec<Value> = vec![];
     while let Some(row) = s.next().await {
         done.push(row);
@@ -1195,12 +1464,13 @@ pub async fn ping(a: &Args, t: &Target) -> CheckResult {
         }
         let mut err = Vec::new();
         let _ = (&mut stderr).take(4096).read_to_end(&mut err).await;
-        let _ = child.wait().await;
-        (raw, err)
+        let status = child.wait().await;
+        (raw, err, status)
     };
-    let (out_raw, err_raw) = tokio::time::timeout(Duration::from_secs(a.timeout.max(12)), read_all)
-        .await
-        .map_err(|_| "ping timeout")?;
+    let (out_raw, err_raw, status) =
+        tokio::time::timeout(Duration::from_secs(a.timeout.max(12)), read_all)
+            .await
+            .map_err(|_| "ping timeout")?;
     let raw = String::from_utf8_lossy(&out_raw).into_owned();
     let samples = parse_ping(&raw, PING_COUNT);
     let received = samples.iter().filter(|s| s.is_some()).count();
@@ -1208,21 +1478,64 @@ pub async fn ping(a: &Args, t: &Target) -> CheckResult {
         "ip": ip, "from": from, "method": "icmp", "sent": PING_COUNT, "received": received,
         "samples": samples.iter().enumerate().map(|(i, ms)| json!({"seq": i + 1, "ms": ms})).collect::<Vec<_>>(),
         "raw": raw,
+        "exit_code": status.as_ref().ok().and_then(|s| s.code()),
     });
+    let stderr = String::from_utf8_lossy(&err_raw);
     if received == 0 {
         return Err(CheckFailure {
             error: format!(
                 "ping failed: no ICMP replies (many hosts drop ping; that is not \"down\"). {}{}",
                 raw.trim(),
-                String::from_utf8_lossy(&err_raw).trim()
+                stderr.trim()
             ),
             data,
         });
     }
-    Ok(data)
+    // Replies arrived. Packet loss is a measurement, not a failure: Linux
+    // iputils exits 1 when fewer than all replies arrive by the deadline, while
+    // macOS and Windows exit 0 once any reply arrives. Other nonzero exits
+    // (e.g. 2, an error after the first reply) fail the check; samples are kept.
+    match status {
+        Ok(s) if s.success() || s.code() == Some(1) => Ok(data),
+        Ok(s) => Err(CheckFailure {
+            error: format!(
+                "ping exited with {s} after {received}/{PING_COUNT} replies{}",
+                if stderr.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", stderr.trim())
+                }
+            ),
+            data,
+        }),
+        Err(e) => Err(CheckFailure {
+            error: format!("could not read ping's exit status: {e}"),
+            data,
+        }),
+    }
 }
 
 // ── propagation ────────────────────────────────────────────────────────────
+
+/// What one server says about `host` A, in a form that compares like for like:
+/// the rcode, a CNAME at the name itself (if any) and the A values at the name.
+/// Authoritative servers do not chase out-of-zone aliases, so only the
+/// name's own records are compared, never the resolver's chased chain.
+fn a_evidence(ans: &dns::Answer, host: &str) -> Value {
+    let mut cname = ans
+        .records
+        .iter()
+        .filter(|r| r.rr_class == 1 && r.rr_type == "CNAME")
+        .filter(|r| r.name.trim_end_matches('.').eq_ignore_ascii_case(host))
+        .map(|r| host_of(&r.value));
+    let mut answers = ans.values_at(host);
+    answers.sort();
+    json!({
+        "outcome": if ans.outcome == dns::Outcome::NxDomain { "nxdomain" } else { "noerror" },
+        "cname": cname.next(),
+        "answers": answers,
+    })
+}
 
 pub async fn propagation(a: &Args, t: &Target) -> CheckResult {
     let host = need_domain(t, "propagation")?
@@ -1238,7 +1551,7 @@ pub async fn propagation(a: &Args, t: &Target) -> CheckResult {
         zone = zone.split_once('.').ok_or("no authoritative zone found")?.1;
     };
     let zone = zone.to_string();
-    let rows: Vec<Value> = stream::iter(ns.iter().take(6).map(|server| {
+    let rows: Vec<Value> = join_all(ns.iter().take(6).map(|server| {
         let (zone, host) = (zone.clone(), host.clone());
         async move {
             let ips = match addresses(a, server).await {
@@ -1256,25 +1569,37 @@ pub async fn propagation(a: &Args, t: &Target) -> CheckResult {
                     let soa_rec = soa.values_at(&zone).into_iter().next();
                     let serial = soa_rec.as_ref().and_then(|v| v.split_whitespace().nth(2)?.parse::<u64>().ok());
                     let provider = soa_rec.as_ref().and_then(|v| v.split_whitespace().next()).map(host_of).unwrap_or_default();
-                    let mut answers = ans.values_at(&host);
-                    answers.sort();
+                    let evidence = a_evidence(&ans, &host);
+                    let authoritative = soa.authoritative && ans.authoritative;
                     let (kind, detail) = match serial {
                         None => ("error", "nameserver returned no SOA serial"),
-                        Some(_) if !soa.authoritative => ("warn", "answer is not authoritative (lame delegation?)"),
+                        Some(_) if !authoritative => ("warn", "answer is not authoritative (lame delegation?); not counted"),
                         Some(_) => ("pass", ""),
                     };
-                    json!({"server": server, "ip": ip, "serial": serial, "provider": provider, "answers": answers, "aa": soa.authoritative, "kind": kind, "detail": detail})
+                    json!({"server": server, "ip": ip, "serial": serial, "provider": provider,
+                        "answers": evidence["answers"], "cname": evidence["cname"], "outcome": evidence["outcome"],
+                        "evidence": evidence, "aa": authoritative, "kind": kind, "detail": detail})
                 }
                 (Err(e), _) | (_, Err(e)) => json!({"server": server, "ip": ip, "kind": "error", "answers": [], "detail": if e.contains("timeout") { "nameserver query timed out".to_string() } else { e }}),
             }
         }
     }))
-    .buffered(2)
-    .collect()
     .await;
-    let mut rows = rows;
+    let recursive = lookup(a, &host, "A", a.resolver, true).await;
+    propagation_report(&zone, &host, rows, &recursive, &a.resolver.to_string())
+}
+
+/// Compares the per-server rows with each other and with the recursive answer.
+fn propagation_report(
+    zone: &str,
+    host: &str,
+    mut rows: Vec<Value>,
+    recursive: &Result<dns::Answer, String>,
+    resolver: &str,
+) -> CheckResult {
+    // Only authoritative answers with a serial substantiate agreement.
     let ok: Vec<usize> = (0..rows.len())
-        .filter(|i| rows[*i]["serial"].is_u64())
+        .filter(|i| rows[*i]["serial"].is_u64() && rows[*i]["aa"] == true)
         .collect();
     let mut by_provider: std::collections::BTreeMap<String, std::collections::BTreeSet<u64>> =
         Default::default();
@@ -1289,8 +1614,10 @@ pub async fn propagation(a: &Args, t: &Target) -> CheckResult {
         .filter(|(_, s)| s.len() > 1)
         .map(|(p, _)| p)
         .collect();
-    let sets: std::collections::BTreeSet<String> =
-        ok.iter().map(|&i| rows[i]["answers"].to_string()).collect();
+    let sets: std::collections::BTreeSet<String> = ok
+        .iter()
+        .map(|&i| rows[i]["evidence"].to_string())
+        .collect();
     let serials_differ = !split.is_empty();
     let answers_differ = sets.len() > 1;
     for &i in &ok {
@@ -1299,29 +1626,60 @@ pub async fn propagation(a: &Args, t: &Target) -> CheckResult {
             rows[i]["kind"] = json!("warn");
         }
     }
-    let recursive = lookup(a, &host, "A", a.resolver, true).await;
-    let mut rec_answers = recursive
-        .as_ref()
-        .map(|r| r.values_at(&host))
-        .unwrap_or_default();
-    rec_answers.sort();
-    let matches =
-        !ok.is_empty() && sets.len() == 1 && sets.contains(&json!(rec_answers).to_string());
+    for row in &mut rows {
+        if let Some(o) = row.as_object_mut() {
+            o.remove("evidence");
+        }
+    }
+    let (rec_answers, matches) = match recursive {
+        Ok(r) => {
+            let evidence = a_evidence(r, host);
+            let chased = {
+                let mut v = r.values();
+                v.sort();
+                v
+            };
+            let matches = !ok.is_empty() && sets.len() == 1 && sets.contains(&evidence.to_string());
+            (chased, json!(matches))
+        }
+        // Unknown, not "differs" and never "matches".
+        Err(_) => (vec![], Value::Null),
+    };
+    let failed_servers: Vec<&str> = rows
+        .iter()
+        .filter(|r| r["kind"] == "error")
+        .filter_map(|r| r["server"].as_str())
+        .collect();
     let data = json!({
         "zone": zone, "name": host, "providers": by_provider.len(),
-        "recursive": {"resolver": a.resolver.to_string(), "answers": rec_answers, "matches": matches},
+        "recursive": {"resolver": resolver, "answers": rec_answers, "matches": matches,
+            "error": recursive.as_ref().err()},
         "agree": !ok.is_empty() && !serials_differ && !answers_differ,
         "serials_differ": serials_differ, "answers_differ": answers_differ, "checked": ok.len(),
         "servers": rows,
-        "scope": "up to six authoritative servers; A answers and SOA evidence",
+        "scope": "up to six authoritative servers; A answers and SOA evidence; non-authoritative answers are not counted",
     });
+    let mut problems = vec![];
     if ok.is_empty() {
-        return Err(CheckFailure {
-            error: "no nameserver answered".into(),
-            data,
-        });
+        problems.push("no nameserver gave an authoritative answer".to_string());
     }
-    Ok(data)
+    if !failed_servers.is_empty() {
+        problems.push(format!(
+            "no usable answer from {}",
+            failed_servers.join(", ")
+        ));
+    }
+    if let Err(e) = recursive {
+        problems.push(format!("recursive lookup failed: {e}"));
+    }
+    if problems.is_empty() {
+        Ok(data)
+    } else {
+        Err(CheckFailure {
+            error: problems.join("; "),
+            data,
+        })
+    }
 }
 
 fn unique(v: &mut Vec<String>) {
@@ -1369,12 +1727,10 @@ pub async fn subdomains(a: &Args, t: &Target) -> CheckResult {
         .flat_map(|l| ["A", "AAAA"].map(|ty| (l.clone(), ty)))
         .collect();
     let results: Vec<(String, Result<dns::Answer, String>)> =
-        stream::iter(queries.into_iter().map(|(label, ty)| async move {
+        join_all(queries.into_iter().map(|(label, ty)| async move {
             let r = lookup(a, &format!("{label}.{base}"), ty, a.resolver, true).await;
             (label, r)
         }))
-        .buffered(a.concurrency as usize * 2)
-        .collect()
         .await;
     let signature = |label: &str| {
         let mut parts: Vec<String> = results
@@ -1430,10 +1786,222 @@ pub async fn subdomains(a: &Args, t: &Target) -> CheckResult {
                 "possible_wildcard": !sig.is_empty() && wildcard.contains(&sig), "status": status})
         })
         .collect();
-    Ok(json!({
+    let unavailable: Vec<&str> = rows
+        .iter()
+        .filter(|r| r["status"] == "unavailable")
+        .filter_map(|r| r["name"].as_str())
+        .collect();
+    let control_failed = results
+        .iter()
+        .any(|(l, r)| controls.contains(l) && failed(r));
+    let mut problems = vec![];
+    if !unavailable.is_empty() {
+        problems.push(format!("lookups failed for {}", unavailable.join(", ")));
+    }
+    if control_failed {
+        problems.push("wildcard control lookups failed".to_string());
+    }
+    let data = json!({
         "base": base, "tested": COMMON_NAMES.len(), "queries": results.len(), "controls": controls.len(),
         "wildcard_observed": !wildcard.is_empty(),
         "coverage": "20 common names beneath the entered hostname, with randomized wildcard controls; not complete discovery. Wildcard matches remain visible.",
         "rows": rows,
-    }))
+    });
+    if problems.is_empty() {
+        Ok(data)
+    } else {
+        Err(CheckFailure {
+            error: problems.join("; "),
+            data,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn answer(
+        name: &str,
+        ty: &str,
+        outcome: dns::Outcome,
+        records: &[(&str, &str, &str)],
+    ) -> dns::Answer {
+        dns::Answer {
+            name: name.into(),
+            rr_type: ty.into(),
+            server: "fixture".into(),
+            status: "fixture".into(),
+            outcome,
+            authoritative: false,
+            authenticated: false,
+            records: records
+                .iter()
+                .map(|(n, t, v)| dns::Record {
+                    name: (*n).into(),
+                    rr_type: (*t).into(),
+                    rr_class: 1,
+                    ttl: 1,
+                    value: (*v).into(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn prefix_matching_is_utf8_safe() {
+        let prefixes = [
+            "v=spf1",
+            "v=DMARC1",
+            "v=STSv1",
+            "v=TLSRPTv1",
+            "v=BIMI1",
+            "v=DKIM1",
+        ];
+        for p in prefixes {
+            for cut in 0..=p.len() + 1 {
+                for tail in ["€", "é", "😀", "\u{0301}"] {
+                    let s = format!("{}{tail}", &p[..cut.min(p.len())]);
+                    let _ = starts_ci(&s, p);
+                    let _ = has_version(&s, &p[2..]);
+                    let _ = dkim_key(&s);
+                }
+            }
+        }
+        assert!(starts_ci("V=SPF1 -all", "v=spf1"));
+        assert!(!starts_ci("aaaaa€", "v=spf1"));
+        assert!(has_version("v=DMARC1; p=reject", "DMARC1"));
+        assert!(has_version(" v = STSv1 ;id=1", "STSv1"));
+        assert!(!has_version("v=DMARC10; p=reject", "DMARC1"));
+        assert!(!has_version("p=reject; v=DMARC1", "DMARC1"));
+    }
+
+    #[test]
+    fn dkim_key_structure() {
+        use DkimKey::*;
+        assert_eq!(dkim_key("v=DKIM1; k=rsa; p=MIIBIjAN"), Some(Published));
+        assert_eq!(dkim_key("k=rsa; p=MIIB IjAN"), Some(Published));
+        assert_eq!(dkim_key("v=DKIM1; p="), Some(Revoked));
+        assert!(matches!(dkim_key("v=DKIM1; k=rsa"), Some(Malformed(_))));
+        assert!(matches!(dkim_key("v=DKIM1; p=***"), Some(Malformed(_))));
+        assert!(matches!(dkim_key("v=DKIM1; p=AAA"), Some(Malformed(_))));
+        assert!(matches!(dkim_key("v=DKIM1; p=a; p=b"), Some(Malformed(_))));
+        assert!(matches!(
+            dkim_key("k=rsa; v=DKIM1; p=AAAA"),
+            Some(Malformed(_))
+        ));
+        assert!(matches!(dkim_key("v=DKIM10; p=AAAA"), Some(Malformed(_))));
+        assert_eq!(dkim_key("google-site-verification=abc"), None);
+        assert_eq!(dkim_key("v=spf1 -all"), None);
+    }
+
+    #[test]
+    fn providers_match_at_label_boundaries() {
+        let p = dns_hosting_providers(&[
+            "ns.cloudflare.com.unrelated.test".into(),
+            "evilcloudflare.com".into(),
+            "ns-1.awsdns-01.co.uk.".into(),
+            "ns.awsdns-01.com.unrelated.test".into(),
+            "ns1-01.azure-dns.info".into(),
+            "Kate.NS.Cloudflare.com.".into(),
+        ]);
+        let names: Vec<(&str, &str)> = p
+            .iter()
+            .map(|v| (v["name"].as_str().unwrap(), v["basis"].as_str().unwrap()))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("cloudflare.com.unrelated.test", "nameserver-domain"),
+                ("evilcloudflare.com", "nameserver-domain"),
+                ("Amazon Route 53", "recognized"),
+                ("awsdns-01.com.unrelated.test", "nameserver-domain"),
+                ("Microsoft Azure DNS", "recognized"),
+                ("Cloudflare", "recognized"),
+            ]
+        );
+    }
+
+    fn server(name: &str, aa: bool, evidence: Value) -> Value {
+        json!({"server": name, "serial": 7, "provider": "ns.example.test", "aa": aa,
+            "answers": evidence["answers"], "evidence": evidence, "kind": if aa { "pass" } else { "warn" }})
+    }
+
+    #[test]
+    fn propagation_needs_authoritative_evidence() {
+        let host = "www.example.test";
+        let empty = json!({"outcome": "noerror", "cname": null, "answers": []});
+        let ok_rec = Ok(answer(host, "A", dns::Outcome::NoError, &[]));
+        // Lame servers do not count, even when they agree.
+        let lame = vec![
+            server("a", false, empty.clone()),
+            server("b", false, empty.clone()),
+        ];
+        let r = propagation_report("example.test", host, lame, &ok_rec, "fixture");
+        let Err(f) = r else {
+            panic!("lame-only must fail")
+        };
+        assert_eq!(f.data["checked"], 0);
+        assert_eq!(f.data["agree"], false);
+        assert_eq!(f.data["recursive"]["matches"], false);
+        // A failed recursive lookup is unknown, never a match.
+        let auth = vec![
+            server("a", true, empty.clone()),
+            server("b", true, empty.clone()),
+        ];
+        let r = propagation_report(
+            "example.test",
+            host,
+            auth.clone(),
+            &Err("DNS timeout".into()),
+            "fixture",
+        );
+        let Err(f) = r else {
+            panic!("recursive failure must fail")
+        };
+        assert_eq!(f.data["recursive"]["matches"], Value::Null);
+        assert_eq!(f.data["agree"], true);
+        // Agreement and a matching recursive answer.
+        let r = propagation_report("example.test", host, auth, &ok_rec, "fixture");
+        assert_eq!(r.ok().unwrap()["recursive"]["matches"], true);
+        // NXDOMAIN versus NODATA, and different aliases, are different answers.
+        let nx = json!({"outcome": "nxdomain", "cname": null, "answers": []});
+        let alias = |t: &str| json!({"outcome": "noerror", "cname": t, "answers": []});
+        for other in [nx, alias("b.cdn.test")] {
+            let rows = vec![
+                server("a", true, alias("a.cdn.test")),
+                server("b", true, other),
+            ];
+            let d = propagation_report("example.test", host, rows, &ok_rec, "fixture")
+                .ok()
+                .unwrap();
+            assert_eq!(d["answers_differ"], true);
+            assert_eq!(d["agree"], false);
+        }
+    }
+
+    #[test]
+    fn a_evidence_compares_the_name_itself() {
+        let host = "www.example.test";
+        let authoritative = answer(
+            host,
+            "A",
+            dns::Outcome::NoError,
+            &[(host, "CNAME", "edge.cdn.test.")],
+        );
+        let recursive = answer(
+            host,
+            "A",
+            dns::Outcome::NoError,
+            &[
+                (host, "CNAME", "edge.cdn.test."),
+                ("edge.cdn.test.", "A", "192.0.2.1"),
+            ],
+        );
+        assert_eq!(
+            a_evidence(&authoritative, host),
+            a_evidence(&recursive, host)
+        );
+        assert_eq!(a_evidence(&recursive, host)["cname"], "edge.cdn.test");
+    }
 }

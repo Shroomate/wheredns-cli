@@ -15,7 +15,7 @@ use std::{
     collections::HashMap,
     io::{self, IsTerminal, Write},
     net::{IpAddr, SocketAddr},
-    sync::{Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -47,7 +47,7 @@ Examples:
 
 Themes: btop (default), tty, purple, phosphor, amber, ansi (terminal colors), none.
 
-Settings (saved in ~/.config/wheredns/config):
+Settings (saved in ~/.config/wheredns/config; %APPDATA%\\wheredns\\config on Windows):
   wheredns config                          show settings and the file path
   wheredns config set theme tty            keep a theme
   wheredns config set checks where web dns default checks for a domain
@@ -85,7 +85,7 @@ pub struct Args {
     /// Whole-run deadline in seconds
     #[arg(long,default_value_t=60,value_parser=clap::value_parser!(u64).range(1..=300))]
     pub deadline: u64,
-    /// Parallel DNS/TCP operations per check
+    /// DNS queries in flight at once, per check
     #[arg(long,default_value_t=4,value_parser=clap::value_parser!(u8).range(1..=16))]
     pub concurrency: u8,
     /// Recursive DNS resolver (IP:port)
@@ -308,13 +308,42 @@ fn partial(g: Group) -> Option<Value> {
 }
 
 type CacheKey = (String, String, SocketAddr, bool);
+pub type Shared<T> = Arc<tokio::sync::OnceCell<T>>;
 
-fn cache() -> &'static Mutex<HashMap<CacheKey, Result<dns::Answer, String>>> {
-    static CACHE: OnceLock<Mutex<HashMap<CacheKey, Result<dns::Answer, String>>>> = OnceLock::new();
+type DnsCache = Mutex<HashMap<CacheKey, Shared<Result<dns::Answer, String>>>>;
+
+fn cache() -> &'static DnsCache {
+    static CACHE: OnceLock<DnsCache> = OnceLock::new();
     CACHE.get_or_init(Default::default)
 }
 
-/// One DNS question, memoized for the run so checks share evidence.
+/// The run-wide slot for `key`: the first caller fills it, everyone else (even
+/// while the first request is still in flight) waits for and shares the result.
+/// If the filling caller is cancelled, the next waiter takes over.
+pub fn shared_slot<K: std::hash::Hash + Eq, T>(
+    map: &Mutex<HashMap<K, Shared<T>>>,
+    key: K,
+) -> Shared<T> {
+    map.lock().unwrap().entry(key).or_default().clone()
+}
+
+tokio::task_local! {
+    /// Per-check bound on in-flight network operations (`--concurrency`).
+    static LIMIT: Arc<tokio::sync::Semaphore>;
+}
+
+/// Runs one network operation under the current check's `--concurrency` limit.
+pub async fn limited<F: std::future::Future>(op: F) -> F::Output {
+    let permit = match LIMIT.try_with(Arc::clone) {
+        Ok(sem) => sem.acquire_owned().await.ok(),
+        Err(_) => None,
+    };
+    let out = op.await;
+    drop(permit);
+    out
+}
+
+/// One DNS question, shared for the run so checks never ask the same thing twice.
 pub async fn lookup(
     a: &Args,
     name: &str,
@@ -324,23 +353,25 @@ pub async fn lookup(
 ) -> Result<dns::Answer, String> {
     permit(server.ip(), a)?;
     let key = (
-        name.to_ascii_lowercase(),
-        kind.to_string(),
+        name.trim_end_matches('.').to_ascii_lowercase(),
+        kind.to_ascii_uppercase(),
         server,
         recursive,
     );
-    if let Some(hit) = cache().lock().unwrap().get(&key) {
-        return hit.clone();
-    }
-    let result = tokio::time::timeout(
-        Duration::from_secs(a.timeout),
-        dns::query(name, kind, server, recursive),
-    )
+    let slot = shared_slot(cache(), key);
+    slot.get_or_init(|| {
+        limited(async {
+            tokio::time::timeout(
+                Duration::from_secs(a.timeout),
+                dns::query(name, kind, server, recursive),
+            )
+            .await
+            .map_err(|_| "DNS timeout".to_string())
+            .and_then(|r| r)
+        })
+    })
     .await
-    .map_err(|_| "DNS timeout".to_string())
-    .and_then(|r| r);
-    cache().lock().unwrap().insert(key, result.clone());
-    result
+    .clone()
 }
 
 pub async fn addresses(a: &Args, host: &str) -> Result<Vec<IpAddr>, String> {
@@ -370,19 +401,8 @@ pub async fn addresses(a: &Args, host: &str) -> Result<Vec<IpAddr>, String> {
 
 async fn run_group(a: &Args, t: &Target, g: Group) -> Row {
     let start = Instant::now();
-    let result = match g {
-        Group::Where => checks::where_(a, t).await,
-        Group::Email => checks::email(a, t).await,
-        Group::Ping => checks::ping(a, t).await,
-        Group::Whois => checks::whois(a, t).await,
-        Group::Web => checks::web(a, t).await,
-        Group::Dns => checks::dns(a, t).await,
-        Group::Blacklist => checks::blacklist(a, t).await,
-        Group::Ip => checks::ip(a, t).await,
-        Group::Ports => checks::ports(a, t).await,
-        Group::Propagation => checks::propagation(a, t).await,
-        Group::Subdomains => checks::subdomains(a, t).await,
-    };
+    let limit = Arc::new(tokio::sync::Semaphore::new(a.concurrency as usize));
+    let result = LIMIT.scope(limit, run_check(a, t, g)).await;
     let elapsed_ms = start.elapsed().as_millis();
     match result {
         Ok(data) => Row {
@@ -399,6 +419,22 @@ async fn run_group(a: &Args, t: &Target, g: Group) -> Row {
             data: f.data,
             error: Some(f.error),
         },
+    }
+}
+
+async fn run_check(a: &Args, t: &Target, g: Group) -> Result<Value, CheckFailure> {
+    match g {
+        Group::Where => checks::where_(a, t).await,
+        Group::Email => checks::email(a, t).await,
+        Group::Ping => checks::ping(a, t).await,
+        Group::Whois => checks::whois(a, t).await,
+        Group::Web => checks::web(a, t).await,
+        Group::Dns => checks::dns(a, t).await,
+        Group::Blacklist => checks::blacklist(a, t).await,
+        Group::Ip => checks::ip(a, t).await,
+        Group::Ports => checks::ports(a, t).await,
+        Group::Propagation => checks::propagation(a, t).await,
+        Group::Subdomains => checks::subdomains(a, t).await,
     }
 }
 
@@ -596,8 +632,51 @@ fn draw(
     s
 }
 
+static CURSOR_HIDDEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Shows the cursor again if the live view hid it. Safe to call more than once;
+/// also runs from the panic hook so a crash never leaves the cursor invisible.
+fn restore_terminal() {
+    if CURSOR_HIDDEN.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        let mut out = io::stdout().lock();
+        let _ = write!(out, "\x1b[?2026l\x1b[J\x1b[?25h");
+        let _ = out.flush();
+    }
+}
+
+/// Reads `headers` input under the whole-run deadline and Ctrl+C. The read runs
+/// on a plain thread that `process::exit` abandons if input stalls.
+async fn read_headers(a: &Args) -> String {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(headers::read(io::stdin()));
+    });
+    let stop = tokio::select! {
+        r = rx => match r {
+            Ok(Ok(raw)) => return raw,
+            Ok(Err(e)) => usage(e),
+            Err(_) => usage("header input: reader stopped"),
+        },
+        _ = tokio::time::sleep(Duration::from_secs(a.deadline)) => "aggregate deadline exceeded while reading header input",
+        _ = tokio::signal::ctrl_c() => "cancelled",
+    };
+    if a.json {
+        let doc =
+            serde_json::json!({"schema_version": SCHEMA_VERSION, "complete": false, "error": stop});
+        let _ = writeln!(io::stdout().lock(), "{doc}");
+    } else {
+        eprintln!("wheredns: headers: {stop}");
+    }
+    std::process::exit(130)
+}
+
 #[tokio::main]
 async fn main() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_terminal();
+        default_hook(info)
+    }));
     let mut a = Args::parse();
     if a.target.as_deref() == Some("config") {
         if let Err(e) = config::command(&a.checks) {
@@ -610,7 +689,7 @@ async fn main() {
     let animate = a.animate.or(cfg.animate).unwrap_or_default();
     let background = cfg.background.unwrap_or(false);
     if a.target.as_deref() == Some("headers") {
-        let raw = headers::read(io::stdin()).unwrap_or_else(|e| usage(e));
+        let raw = read_headers(&a).await;
         let v = headers::parse(&raw);
         let out = if a.json {
             serde_json::to_string(&v).unwrap()
@@ -642,6 +721,7 @@ async fn main() {
     let mut stdout = io::stdout().lock();
     if !a.json {
         if full {
+            CURSOR_HIDDEN.store(true, std::sync::atomic::Ordering::SeqCst);
             write!(stdout, "\x1b[?25l").ok();
         }
         write!(stdout, "{}", renderer.header(&t.host, &groups)).ok();
@@ -731,13 +811,28 @@ async fn main() {
                 }
                 rows.push(row)
             }
-            None if stop.is_some() => rows.push(Row {
-                check: groups[i].id().into(),
-                ok: false,
-                elapsed_ms: start.elapsed().as_millis(),
-                data: Value::Null,
-                error: Some(stop.unwrap().into()),
-            }),
+            None if stop.is_some() => {
+                // Keep whatever the check had already published; it is marked
+                // incomplete so pending work is never read as finished.
+                let data = match partial(groups[i]) {
+                    Some(Value::Object(mut o)) => {
+                        o.insert("incomplete".into(), Value::Bool(true));
+                        Value::Object(o)
+                    }
+                    _ => Value::Null,
+                };
+                let row = Row {
+                    check: groups[i].id().into(),
+                    ok: false,
+                    elapsed_ms: start.elapsed().as_millis(),
+                    data,
+                    error: Some(stop.unwrap().into()),
+                };
+                if i >= printed && !a.json {
+                    write!(stdout, "{}", renderer.panel(&row, Some(groups[i]))).ok();
+                }
+                rows.push(row)
+            }
             None => {}
         }
     }
@@ -764,11 +859,10 @@ async fn main() {
         writeln!(stdout, "{}", serde_json::to_string(&report).unwrap()).ok();
     } else {
         write!(stdout, "{}", renderer.footer(&report)).ok();
-        if full {
-            write!(stdout, "\x1b[?25h").ok();
-        }
     }
     stdout.flush().ok();
+    drop(stdout);
+    restore_terminal();
     if !ok {
         std::process::exit(if complete { 1 } else { 130 })
     }

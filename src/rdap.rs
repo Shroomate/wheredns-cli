@@ -1,20 +1,46 @@
 //! RDAP registration evidence through rdap.org redirect routing, parsed into the
 //! fields shown in the whois panel. Every hop is resolved and pinned by policy.
 
-use crate::{addresses, Args};
+use crate::{addresses, shared_slot, Args, Shared};
 use serde_json::{json, Value};
-use std::{net::SocketAddr, time::Duration};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    sync::{Mutex, OnceLock},
+    time::Duration,
+};
 
 const MAX_BODY: usize = 1024 * 1024;
 
+/// Deepest suffix tried as a registration (e.g. `foo.pvt.k12.ma.us`).
+const MAX_REGISTRABLE_LABELS: usize = 5;
+
+const NOT_FOUND: &str = "no registration record found (registry returned 404)";
+
+/// True for the "registry has no such domain" result, as opposed to a failure.
+pub fn is_not_found(e: &str) -> bool {
+    e == NOT_FOUND
+}
+
+#[derive(Clone)]
 pub struct Fetched {
     pub status: u16,
     pub body: Value,
     pub source: String,
 }
 
-/// GET an RDAP document, following at most four HTTPS redirects.
+type Fetches = Mutex<HashMap<String, Shared<Result<Fetched, String>>>>;
+
+/// GET an RDAP document once per run: `where`, `whois` and `ip` share answers
+/// for the same URL, including requests that are still in flight.
 pub async fn get_json(a: &Args, url: &str) -> Result<Fetched, String> {
+    static FETCHES: OnceLock<Fetches> = OnceLock::new();
+    let slot = shared_slot(FETCHES.get_or_init(Default::default), url.to_string());
+    slot.get_or_init(|| fetch(a, url)).await.clone()
+}
+
+/// GET an RDAP document, following at most four HTTPS redirects.
+async fn fetch(a: &Args, url: &str) -> Result<Fetched, String> {
     use futures_util::StreamExt;
     let mut url = reqwest::Url::parse(url).map_err(|e| e.to_string())?;
     for _ in 0..5 {
@@ -179,16 +205,27 @@ fn country(entities: &[&Value]) -> Option<String> {
     (found.len() == 1).then(|| found.into_iter().next().unwrap())
 }
 
+/// Suffixes of `labels` to try as the registration, longest first: at most
+/// MAX_REGISTRABLE_LABELS deep and never a single label.
+fn candidates(labels: &[&str]) -> Vec<String> {
+    (2..=labels.len().min(MAX_REGISTRABLE_LABELS))
+        .rev()
+        .map(|keep| labels[labels.len() - keep..].join(".").to_ascii_lowercase())
+        .collect()
+}
+
 /// Registration for the registrable domain that contains `host`.
 pub async fn domain(a: &Args, host: &str) -> Result<Value, String> {
     let labels: Vec<&str> = host.trim_end_matches('.').split('.').collect();
     if labels.len() < 2 {
         return Err("no registrable domain in a single-label name".into());
     }
-    // Longest candidate first; registries answer 404 for names below the registration.
-    let mut last = String::from("no registration record found (registry returned 404)");
-    for skip in 0..labels.len().saturating_sub(1).min(3) {
-        let candidate = labels[skip..].join(".").to_ascii_lowercase();
+    // Longest candidate first; registries answer 404 for names below the
+    // registration. Names deeper than any plausible registration start at
+    // MAX_REGISTRABLE_LABELS, so a.b.c.example.test still reaches example.test
+    // and the request count stays bounded.
+    let mut last = String::from(NOT_FOUND);
+    for candidate in candidates(&labels) {
         let r = get_json(a, &format!("https://rdap.org/domain/{candidate}")).await?;
         match r.status {
             200 => return parse_domain(a, &candidate, r).await,
@@ -200,13 +237,18 @@ pub async fn domain(a: &Args, host: &str) -> Result<Value, String> {
     Err(last)
 }
 
+/// The document describes exactly `domain` (same normalization for the first
+/// response and for referrals).
+fn is_domain(d: &Value, domain: &str) -> bool {
+    d["objectClassName"] == "domain"
+        && d["ldhName"]
+            .as_str()
+            .is_some_and(|n| n.trim_end_matches('.').eq_ignore_ascii_case(domain))
+}
+
 async fn parse_domain(a: &Args, candidate: &str, r: Fetched) -> Result<Value, String> {
     let d = &r.body;
-    if d["objectClassName"] != "domain"
-        || !d["ldhName"]
-            .as_str()
-            .is_some_and(|n| n.trim_end_matches('.').eq_ignore_ascii_case(candidate))
-    {
+    if !is_domain(d, candidate) {
         return Err("registry returned a different or malformed domain".into());
     }
     let registrar = find_entity(&d["entities"], "registrar");
@@ -242,10 +284,14 @@ async fn parse_domain(a: &Args, candidate: &str, r: Fetched) -> Result<Value, St
         })
     });
     let mut registrant_redacted = registrant.is_none() && redacted(d, "registrant");
+    let mut referral = Value::Null;
     if let Some(href) = related.filter(|_| registrant.is_none() || registrant_country.is_none()) {
         if let Ok(rr) = get_json(a, href).await {
             let body = &rr.body;
-            if rr.status == 200 && body["objectClassName"] == "domain" {
+            // A referral for another domain must never fill in this one's owner.
+            let matches = rr.status == 200 && is_domain(body, candidate);
+            referral = json!({"source": rr.source, "used": matches});
+            if matches {
                 let mut ref_registrants = vec![];
                 find_entities(&body["entities"], "registrant", 0, &mut ref_registrants);
                 if registrant.is_none() {
@@ -301,6 +347,7 @@ async fn parse_domain(a: &Args, candidate: &str, r: Fetched) -> Result<Value, St
         "registrant": registrant,
         "registrant_country": registrant_country,
         "abuse": abuse,
+        "referral": referral,
     }))
 }
 
@@ -349,4 +396,41 @@ pub async fn ip(a: &Args, ip: std::net::IpAddr) -> Result<Value, String> {
         "registered": ev.get("registration"),
         "updated": ev.get("last changed"),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn registration_candidates_reach_the_parent() {
+        let c = |h: &str| candidates(&h.split('.').collect::<Vec<_>>());
+        assert_eq!(
+            c("a.b.c.Example.test"),
+            [
+                "a.b.c.example.test",
+                "b.c.example.test",
+                "c.example.test",
+                "example.test"
+            ]
+        );
+        let deep = c("1.2.3.4.5.6.7.8.example.co.uk");
+        assert_eq!(deep.len(), MAX_REGISTRABLE_LABELS - 1);
+        assert_eq!(deep.last().unwrap(), "co.uk");
+        assert!(deep.contains(&"example.co.uk".to_string()));
+        assert_eq!(c("example.test"), ["example.test"]);
+    }
+    #[test]
+    fn referral_identity_must_match() {
+        let doc = |name: &str| json!({"objectClassName": "domain", "ldhName": name});
+        assert!(is_domain(&doc("EXAMPLE.test."), "example.test"));
+        assert!(!is_domain(&doc("unrelated.test"), "example.test"));
+        assert!(!is_domain(
+            &json!({"objectClassName": "entity", "ldhName": "example.test"}),
+            "example.test"
+        ));
+        assert!(!is_domain(
+            &json!({"objectClassName": "domain"}),
+            "example.test"
+        ));
+    }
 }
