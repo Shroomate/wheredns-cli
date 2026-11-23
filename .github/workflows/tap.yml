@@ -1,0 +1,42 @@
+name: Update Homebrew tap
+on:
+  workflow_call:
+    inputs:
+      tag:
+        type: string
+        required: true
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish to the tap, e.g. v0.2.0
+        type: string
+        required: true
+permissions:
+  contents: read
+jobs:
+  tap:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Copy the release formula into Shroomate/homebrew-tap
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+        run: |
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p wheredns.rb -D formula
+          grep -q "version \"${TAG#v}\"" formula/wheredns.rb
+          install -m 600 /dev/null "$RUNNER_TEMP/tap_key"
+          printf '%s\n' "$DEPLOY_KEY" > "$RUNNER_TEMP/tap_key"
+          export GIT_SSH_COMMAND="ssh -i $RUNNER_TEMP/tap_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+          git clone --depth 1 git@github.com:Shroomate/homebrew-tap.git tap
+          cp formula/wheredns.rb tap/Formula/wheredns.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/wheredns.rb
+          if git diff --cached --quiet; then
+            echo "Tap already has ${TAG#v}"
+          else
+            git commit -m "Update wheredns to ${TAG#v}"
+            git push origin HEAD:main
+          fi
