@@ -13,7 +13,10 @@ pub fn read(reader: impl Read) -> Result<String, String> {
     if bytes.len() > 65536 {
         return Err("headers exceed 64 KiB".into());
     }
-    String::from_utf8(bytes).map_err(|_| "headers require UTF-8".into())
+    // Windows tools (Notepad, Windows PowerShell 5.1 pipes) often prepend a
+    // UTF-8 byte-order mark, which would otherwise corrupt the first field name.
+    let body = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&bytes);
+    String::from_utf8(body.to_vec()).map_err(|_| "headers require UTF-8".into())
 }
 
 pub fn parse(raw: &str) -> Value {
@@ -162,6 +165,11 @@ fn analyze(fields: &[(String, String)]) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn read_strips_utf8_bom() {
+        let raw = read(&b"\xEF\xBB\xBFSubject: caf\xC3\xA9\r\n\r\n"[..]).unwrap();
+        assert_eq!(parse(&raw)["analysis"]["subject"], "caf\u{e9}");
+    }
     #[test]
     fn hop_trace_and_auth() {
         let v = parse(concat!(
