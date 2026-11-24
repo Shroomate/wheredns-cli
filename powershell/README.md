@@ -3,7 +3,7 @@
 A thin wrapper around the bundled Rust CLI. No separate Rust installation,
 Homebrew, Scoop, or executable on PATH is required.
 
-Once the module is published to the PowerShell Gallery:
+Install from the PowerShell Gallery:
 
 ```powershell
 Install-Module WhereDNS -Scope CurrentUser
@@ -59,18 +59,13 @@ Gallery package.
 ## Publish
 
 The release workflow attaches `WhereDNS.VERSION.nupkg` to the GitHub release,
-assembled from the same binaries as the standalone archives. It does not
-publish to the Gallery automatically.
+assembled from the same binaries as the standalone archives, then its
+`psgallery` job (`.github/workflows/psgallery.yml`) pushes that package to the
+PowerShell Gallery with the `PSGALLERY_API_KEY` repository secret. The key
+should be scoped to push `WhereDNS` only. A version already on the Gallery is
+skipped; Gallery versions cannot be replaced, so fix problems with a new
+release. To rerun it for an existing release:
 
-To publish the staged module, with an API key scoped to the package name:
-
-```powershell
-Test-ModuleManifest ./target/powershell/WhereDNS/WhereDNS.psd1
-Publish-PSResource -Path ./target/powershell/WhereDNS -Repository PSGallery -ApiKey $env:PSGALLERY_API_KEY
+```sh
+gh workflow run psgallery.yml -f tag=v0.3.0
 ```
-
-Use Microsoft.PowerShell.PSResourceGet for publication. A Gallery account,
-available/owned `WhereDNS` package name and API key are required. Keep keys out
-of source control. Do not republish an existing module version; publish a new
-CLI/module version instead. Installation examples above become usable after
-the first successful Gallery publication.

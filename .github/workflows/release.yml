@@ -83,3 +83,10 @@ jobs:
     with:
       tag: ${{ github.ref_name }}
     secrets: inherit
+
+  psgallery:
+    needs: release
+    uses: ./.github/workflows/psgallery.yml
+    with:
+      tag: ${{ github.ref_name }}
+    secrets: inherit
