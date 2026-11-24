@@ -35,7 +35,7 @@ utility. Other native runtime requirements are the same as the standalone CLI.
 From the repository root, using the release archives and their SHA256SUMS:
 
 ```sh
-python3 powershell/build-module.py --artifacts dist --output target/powershell --version 0.2.0
+python3 powershell/build-module.py --artifacts dist --output target/powershell --version 0.3.0
 pwsh -NoProfile -File powershell/test-module.ps1 -ModulePath ./target/powershell/WhereDNS
 pwsh -NoProfile -File powershell/package-module.ps1 -ModulePath ./target/powershell/WhereDNS -OutputPath ./target/nupkg
 pwsh -NoProfile -File powershell/test-package.ps1 -PackageDirectory ./target/nupkg
