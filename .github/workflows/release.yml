@@ -64,6 +64,14 @@ jobs:
           packaging/render.sh "$version" dist/SHA256SUMS packaging/wheredns.rb.in > dist/wheredns.rb
           packaging/render.sh "$version" dist/SHA256SUMS packaging/scoop.json.in > dist/wheredns.json
           cat dist/SHA256SUMS
+      - name: Assemble PowerShell module
+        run: python3 powershell/build-module.py --artifacts dist --output target/powershell --version "${GITHUB_REF_NAME#v}"
+      - name: Validate and package PowerShell module
+        shell: pwsh
+        run: |
+          ./powershell/test-module.ps1 -ModulePath ./target/powershell/WhereDNS
+          ./powershell/package-module.ps1 -ModulePath ./target/powershell/WhereDNS -OutputPath ./dist
+          ./powershell/test-package.ps1 -PackageDirectory ./dist
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}

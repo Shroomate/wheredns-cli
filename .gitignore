@@ -6,3 +6,5 @@
 *.key
 .DS_Store
 /diagnostic-results/
+
+/powershell/__pycache__/
