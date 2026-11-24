@@ -27,3 +27,15 @@ jobs:
           python3 tests/loopback_regressions.py
           python3 tests/dns_eligibility.py
       - run: cargo build --locked --release
+      - name: PowerShell module smoke tests
+        shell: pwsh
+        run: |
+          $binary = if ($IsWindows) { './target/release/wheredns.exe' } else { './target/release/wheredns' }
+          ./powershell/test-module.ps1 -BinaryPath $binary
+      - name: Windows PowerShell 5.1 module smoke tests
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: ./powershell/test-module.ps1 -BinaryPath ./target/release/wheredns.exe
+      - name: Module packaging tests
+        if: runner.os == 'Linux'
+        run: python3 -m unittest discover -s powershell -p 'test_*.py'

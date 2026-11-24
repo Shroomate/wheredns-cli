@@ -74,6 +74,13 @@ cargo install --git https://github.com/Shroomate/wheredns-cli --locked
 
 Cargo installs to `~/.cargo/bin`. Add it to `PATH` if `wheredns` is not found.
 
+### PowerShell Gallery packaging
+
+The repository includes a thin `Invoke-WhereDns` PowerShell module with bundled
+binaries. See [PowerShell packaging and publication](powershell/README.md) for
+build, test and Gallery publishing instructions. Gallery installation will be
+available after the first module publication.
+
 ## Quick start
 
 ```sh
