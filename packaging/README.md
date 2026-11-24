@@ -37,6 +37,11 @@
    brew audit --strict --online shroomate/tap/wheredns
    ```
 
+5. The `psgallery` job (`.github/workflows/psgallery.yml`) pushes the release's
+   `WhereDNS.VERSION.nupkg` to the PowerShell Gallery, using the
+   `PSGALLERY_API_KEY` secret. A version already on the Gallery is skipped. To
+   rerun it, `gh workflow run psgallery.yml -f tag=v0.1.0`.
+
 `wheredns.json` is a Scoop manifest for a Scoop bucket.
 
 To render a template by hand from a downloaded `SHA256SUMS`:

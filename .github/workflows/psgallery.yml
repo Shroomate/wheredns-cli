@@ -1,0 +1,32 @@
+name: Publish to PowerShell Gallery
+on:
+  workflow_call:
+    inputs:
+      tag:
+        type: string
+        required: true
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish to the Gallery, e.g. v0.3.0
+        type: string
+        required: true
+permissions:
+  contents: read
+jobs:
+  psgallery:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Push the release module package to the PowerShell Gallery
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          PSGALLERY_API_KEY: ${{ secrets.PSGALLERY_API_KEY }}
+        run: |
+          test -n "$PSGALLERY_API_KEY"
+          version=${TAG#v}
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p "WhereDNS.$version.nupkg" -D nupkg
+          dotnet nuget push "nupkg/WhereDNS.$version.nupkg" \
+            --source https://www.powershellgallery.com/api/v2/package \
+            --api-key "$PSGALLERY_API_KEY" \
+            --skip-duplicate
