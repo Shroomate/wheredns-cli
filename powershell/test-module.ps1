@@ -54,6 +54,7 @@ try {
     Assert (($help -join "`n") -match '--json') 'Help argument was not forwarded'
 
     $subject = 'cafe ' + [char]0x00e9 + ' "quoted"; $literal'
+    $encodingBefore = $OutputEncoding
     $json = "Subject: $subject`r`nX-Test: first`r`nX-Test: second`r`n`r`n" | Invoke-WhereDns headers --json
     Assert ($LASTEXITCODE -eq 0) 'Header pipeline failed'
     $parsed = $json | ConvertFrom-Json
@@ -65,6 +66,7 @@ try {
         Write-Host ('console out: ' + [Console]::OutputEncoding.CodePage + ', OutputEncoding: ' + $OutputEncoding.CodePage)
     }
     Assert ($parsed.analysis.subject -eq $subject) 'UTF-8/quoted pipeline input changed'
+    Assert ($OutputEncoding.CodePage -eq $encodingBefore.CodePage) 'Caller OutputEncoding was not restored'
     Assert ($parsed.fields.Count -eq 3) 'Pipeline input was not forwarded intact'
 
     # Both a single argument containing spaces and multiple flags must survive.

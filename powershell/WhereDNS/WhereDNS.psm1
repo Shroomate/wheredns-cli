@@ -63,12 +63,16 @@ function Invoke-WhereDns {
     # Windows PowerShell turns redirected native stderr into error records.
     # Keep those non-terminating so native exit codes remain the contract.
     $ErrorActionPreference = 'Continue'
-    $OutputEncoding = New-Object System.Text.UTF8Encoding($false)
     $PSNativeCommandUseErrorActionPreference = $false
     # The CLI writes UTF-8. Windows PowerShell 5.1 decodes native output with
     # the console code page (often 437), so switch to UTF-8 for this call only.
     # Hosts without a console can refuse the change; output then stays as-is.
     $utf8 = New-Object System.Text.UTF8Encoding($false)
+    # Windows PowerShell 5.1 encodes stdin for native commands with the global
+    # $OutputEncoding (ASCII by default) and ignores a module-local one, so set
+    # the global for this call only and restore it afterwards.
+    $previousInputEncoding = $global:OutputEncoding
+    $global:OutputEncoding = $utf8
     $previousEncoding = $null
     try {
         if ([Console]::OutputEncoding.CodePage -ne 65001) {
@@ -84,6 +88,7 @@ function Invoke-WhereDns {
         }
         $global:LASTEXITCODE = $LASTEXITCODE
     } finally {
+        $global:OutputEncoding = $previousInputEncoding
         if ($previousEncoding) {
             try { [Console]::OutputEncoding = $previousEncoding } catch { }
         }
