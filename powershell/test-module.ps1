@@ -57,6 +57,13 @@ try {
     $json = "Subject: $subject`r`nX-Test: first`r`nX-Test: second`r`n`r`n" | Invoke-WhereDns headers --json
     Assert ($LASTEXITCODE -eq 0) 'Header pipeline failed'
     $parsed = $json | ConvertFrom-Json
+    if ($parsed.analysis.subject -ne $subject) {
+        # Show code points so an encoding fault is diagnosable from CI logs.
+        $codes = { param($s) (([int[]][char[]][string]$s) | ForEach-Object { '{0:X4}' -f $_ }) -join ' ' }
+        Write-Host ('expected: ' + (& $codes $subject))
+        Write-Host ('actual:   ' + (& $codes $parsed.analysis.subject))
+        Write-Host ('console out: ' + [Console]::OutputEncoding.CodePage + ', OutputEncoding: ' + $OutputEncoding.CodePage)
+    }
     Assert ($parsed.analysis.subject -eq $subject) 'UTF-8/quoted pipeline input changed'
     Assert ($parsed.fields.Count -eq 3) 'Pipeline input was not forwarded intact'
 
