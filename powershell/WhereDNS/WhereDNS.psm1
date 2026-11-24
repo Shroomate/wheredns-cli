@@ -65,12 +65,29 @@ function Invoke-WhereDns {
     $ErrorActionPreference = 'Continue'
     $OutputEncoding = New-Object System.Text.UTF8Encoding($false)
     $PSNativeCommandUseErrorActionPreference = $false
-    if ($MyInvocation.ExpectingInput) {
-        $input | & $executable @args
-    } else {
-        & $executable @args
+    # The CLI writes UTF-8. Windows PowerShell 5.1 decodes native output with
+    # the console code page (often 437), so switch to UTF-8 for this call only.
+    # Hosts without a console can refuse the change; output then stays as-is.
+    $utf8 = New-Object System.Text.UTF8Encoding($false)
+    $previousEncoding = $null
+    try {
+        if ([Console]::OutputEncoding.CodePage -ne 65001) {
+            $previousEncoding = [Console]::OutputEncoding
+            [Console]::OutputEncoding = $utf8
+        }
+    } catch { $previousEncoding = $null }
+    try {
+        if ($MyInvocation.ExpectingInput) {
+            $input | & $executable @args
+        } else {
+            & $executable @args
+        }
+        $global:LASTEXITCODE = $LASTEXITCODE
+    } finally {
+        if ($previousEncoding) {
+            try { [Console]::OutputEncoding = $previousEncoding } catch { }
+        }
     }
-    $global:LASTEXITCODE = $LASTEXITCODE
 }
 
 Export-ModuleMember -Function Invoke-WhereDns
